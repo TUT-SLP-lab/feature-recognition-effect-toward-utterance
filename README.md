@@ -15,6 +15,7 @@ conversation partner (gender and age), and whether an LLM can reproduce that beh
 |---|---|
 | [Dataset_Analysis/](Dataset_Analysis/) | Corpus analysis of CEJC and NUCC (Meidai): sentence-final particles (SFP), first-person pronouns, F0, speaking tempo, fillers, mora counts; plus comparison of LLM-converted speech. |
 | [System_implement/LLM_Response/](System_implement/LLM_Response/) | Gemini persona-vs-persona chat generator whose SFP and pronoun usage is steered by gender/age profiles, plus a counter that classifies the SFPs actually produced. |
+| [System_implement/Voice_Chat_App/](System_implement/Voice_Chat_App/) | Browser voice chat: Kotoba-Whisper (ASR) → `Response_weight_random.py` (single-persona chatbot) → Style-Bert-VITS2 (TTS, voice selectable in the UI). |
 | [System_implement/jvs_to_esd.py](System_implement/jvs_to_esd.py) | Helper that converts a JVS speaker into the Style-Bert-VITS2 training format. |
 
 ## What is NOT in this repo
@@ -92,6 +93,42 @@ python Response_All_AI_weight_random.py --mode counter
 - `data/`: character settings, persona presets, and the SFP / pronoun / address-term buckets (`*_kaExclude*` variants drop the particle か).
 - Output goes to `outputs/chat_logs/<timestamp>/` (chats) and `outputs/sfp_ai_output/` (classification and charts).
 
+### Response_weight_random.py (single-AI chatbot)
+
+A command-line chatbot where **you** talk to one persona (same flow as `Response.py`: persona from `Character_Settings.json`, history summarising, pronoun and address-form locking), using the SFP control from `Response_All_AI_weight_random.py`.
+
+```bash
+cd System_implement/LLM_Response/src
+python Response_weight_random.py            # chat; type exit/quit to stop
+python Response_weight_random.py --debug    # also print the rolled tier and the particle actually used
+```
+
+How SFP usage is controlled each turn:
+
+1. **Category roll**: masculine / neutral / feminine, weighted by the persona's gender (`SFP_CATEGORY_WEIGHTS`, e.g. a masculine speaker is 35 / 50 / 15%).
+2. **Intensity roll**: moderately or strongly (`SFP_INTENSITY_WEIGHTS_BY_CATEGORY`). A roll that crosses to the opposite gender is capped at moderately.
+3. **Prompt**: the rolled tier's particles are offered, with a fallback chain down to neutral that never crosses to the opposite gender, plus the strict "no extra だ/です" rule and a ban on the だ/んだ-family.
+4. **Check and retry**: the reply's final particle is detected (fugashi) and classified (Gemini). If it misses the rolled tier the reply is regenerated up to `SFP_ENFORCE_MAX_ATTEMPTS` (3) times; the best attempt is kept.
+
+Each turn also gets a random pivot strategy (`PIVOT_STRATEGIES`: follow-up question, related own experience, mild disagreement, ...). Change the persona with `ACTIVE_CHARACTER_ID` and the listener with `OPPONENT_PROFILE` at the top of the file. A turn can cost up to three generations plus classifier calls, so replies are slower than `Response.py`.
+
+## Voice_Chat_App
+
+Browser voice chat in [System_implement/Voice_Chat_App/](System_implement/Voice_Chat_App/):
+microphone → **Kotoba-Whisper** (`kotoba-tech/kotoba-whisper-v2.0`) → **`Response_weight_random.py`** → **Style-Bert-VITS2** → audio playback. Typing a message also works.
+
+```bash
+pip install -r System_implement/Voice_Chat_App/requirements.txt
+export GENAI_API_KEY=...
+cd System_implement/Voice_Chat_App
+python app.py                    # http://127.0.0.1:8000 (PORT=... to change)
+```
+
+- **Voice selection**: the page lists every checkpoint found in `System_implement/Style-Bert-VITS2/model_assets/<name>/` (needs `config.json`, `style_vectors.npy` and a `.safetensors`; each checkpoint is its own entry). Style, style weight and speed can be changed per request. To add a voice, drop a model folder in and reload. Set `SBV2_MODEL_ASSETS` to use another directory.
+- **Requirements**: a CUDA GPU is strongly recommended; ffmpeg must be on `PATH`. The Style-Bert-VITS2 checkout is imported from `System_implement/Style-Bert-VITS2/` (not installed as a package), and its own `requirements.txt` pins old torch/numpy, so install the inference dependencies from the app's `requirements.txt` instead. Use `pyopenjtalk-plus` (the `pyopenjtalk-dict` wheel crashes with numpy 2).
+- **Behaviour**: one shared conversation on the server (the "Reset chat" button clears it). The server listens on localhost only, which is also what lets the browser use the microphone. The first request is slow while models load (the ASR model is downloaded from Hugging Face on first use).
+- API: `POST /api/asr` (audio → text), `POST /api/chat` (text → reply), `POST /api/tts` (text, model, style → WAV), `GET /api/models`, `POST /api/reset`.
+
 ## Notes
 
 - The Gemini model name (`gemini-3.5-flash-lite`) is hard-coded in the scripts; change it there if it is retired.
@@ -111,6 +148,7 @@ python Response_All_AI_weight_random.py --mode counter
 |---|---|
 | [Dataset_Analysis/](Dataset_Analysis/) | CEJC と NUCC(名大会話コーパス)の分析。終助詞(SFP)、一人称代名詞、F0、話速、フィラー、モーラ数。LLM による変換発話の比較も含む。 |
 | [System_implement/LLM_Response/](System_implement/LLM_Response/) | 性別・年齢のプロファイルに応じて終助詞・代名詞の使い方を制御した、Gemini 同士のペルソナ会話生成。実際に使われた終助詞を分類するカウンター付き。 |
+| [System_implement/Voice_Chat_App/](System_implement/Voice_Chat_App/) | ブラウザ上の音声対話。Kotoba-Whisper(ASR)→ `Response_weight_random.py`(1人のペルソナとのチャットボット)→ Style-Bert-VITS2(TTS、UIで声を選択可能)。 |
 | [System_implement/jvs_to_esd.py](System_implement/jvs_to_esd.py) | JVS の話者を Style-Bert-VITS2 の学習用形式に変換するスクリプト。 |
 
 ### このリポジトリに含まれないもの
@@ -181,6 +219,42 @@ python Response_All_AI_weight_random.py --mode counter
 - それ以外の `Response*.py` は過去の版で、参考のために残しています(`_v1`、`_no_random`、`_RatioInPrompt`、`Response.py`、`Response_v1_fixBucket.py`)。
 - `data/`: キャラクター設定、ペルソナのプリセット、終助詞・代名詞・呼称の分類表(`*_kaExclude*` は終助詞「か」を除いた版)。
 - 出力先は `outputs/chat_logs/<タイムスタンプ>/`(会話ログ)と `outputs/sfp_ai_output/`(分類結果とグラフ)です。
+
+#### Response_weight_random.py(1人のAIとのチャットボット)
+
+**あなた**が1人のペルソナと会話するコマンドラインのチャットボットです。流れは `Response.py` と同じ(`Character_Settings.json` のペルソナ、履歴の要約、代名詞・呼称の固定)で、終助詞の制御に `Response_All_AI_weight_random.py` の方式を使っています。
+
+```bash
+cd System_implement/LLM_Response/src
+python Response_weight_random.py            # 会話開始。exit / quit で終了
+python Response_weight_random.py --debug    # 選ばれた階級と実際に使われた終助詞も表示
+```
+
+各ターンの終助詞の制御:
+
+1. **カテゴリのロール**: 男性的 / 中立 / 女性的を、ペルソナの性別に応じた重みで選びます(`SFP_CATEGORY_WEIGHTS`。例: 男性話者は 35 / 50 / 15%)。
+2. **強さのロール**: moderately か strongly を選びます(`SFP_INTENSITY_WEIGHTS_BY_CATEGORY`)。話者と逆の性別のカテゴリが出た場合は moderately に制限されます。
+3. **プロンプト**: 選ばれた階級の終助詞を提示し、中立まで下りるフォールバック順(逆の性別には渡らない)を示します。「だ/です を勝手に足さない」という厳格なルールと、だ/んだ系の使用禁止も含みます。
+4. **判定と再生成**: 返答の文末の終助詞を検出(fugashi)し、Gemini で分類します。選ばれた階級と合わなければ最大 `SFP_ENFORCE_MAX_ATTEMPTS`(3)回まで再生成し、最も近いものを採用します。
+
+各ターンでランダムな話題展開の方針(`PIVOT_STRATEGIES`: 掘り下げの質問、関連する自分の経験、穏やかな反対意見など)も与えます。ペルソナはファイル冒頭の `ACTIVE_CHARACTER_ID`、聞き手は `OPPONENT_PROFILE` で変更できます。1ターンで最大3回の生成と分類呼び出しが発生するため、`Response.py` より応答が遅くなります。
+
+### Voice_Chat_App
+
+[System_implement/Voice_Chat_App/](System_implement/Voice_Chat_App/) のブラウザ音声対話アプリです。
+マイク → **Kotoba-Whisper**(`kotoba-tech/kotoba-whisper-v2.0`)→ **`Response_weight_random.py`** → **Style-Bert-VITS2** → 音声再生。文字入力でも使えます。
+
+```bash
+pip install -r System_implement/Voice_Chat_App/requirements.txt
+export GENAI_API_KEY=...
+cd System_implement/Voice_Chat_App
+python app.py                    # http://127.0.0.1:8000 (PORT=... で変更)
+```
+
+- **声の選択**: `System_implement/Style-Bert-VITS2/model_assets/<名前>/` にあるチェックポイントがすべて一覧に出ます(`config.json`、`style_vectors.npy`、`.safetensors` が必要。チェックポイントごとに別の項目)。スタイル、スタイルの強さ、話速はリクエストごとに変更できます。声を追加するにはモデルのフォルダを置いてページを再読み込みします。別のディレクトリを使う場合は `SBV2_MODEL_ASSETS` を設定してください。
+- **必要なもの**: CUDA 対応GPUを強く推奨。ffmpeg が `PATH` にあること。Style-Bert-VITS2 は `System_implement/Style-Bert-VITS2/` のチェックアウトを直接 import します(パッケージとしてはインストールしません)。そちらの `requirements.txt` は古い torch / numpy に固定されているため、推論に必要なものはアプリの `requirements.txt` から入れてください。`pyopenjtalk-plus` を使います(`pyopenjtalk-dict` は numpy 2 でクラッシュします)。
+- **挙動**: 会話はサーバー上で1つだけ共有されます(「Reset chat」ボタンでリセット)。サーバーは localhost のみで待ち受けます(ブラウザがマイクを使えるのもこのためです)。初回リクエストはモデルの読み込みで遅くなります(ASRモデルは初回に Hugging Face からダウンロードされます)。
+- API: `POST /api/asr`(音声→テキスト)、`POST /api/chat`(テキスト→返答)、`POST /api/tts`(テキスト、モデル、スタイル→WAV)、`GET /api/models`、`POST /api/reset`。
 
 ### 注意
 

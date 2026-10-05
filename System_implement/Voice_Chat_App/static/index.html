@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice Chat</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>🎤</text></svg>">
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1d2129; --muted:#6b7280; --accent:#2563eb; --user:#e8f0fe; --bot:#f1f3f5; --rec:#dc2626; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#14161a; --card:#1d2026; --text:#e6e8eb; --muted:#9aa1ab; --accent:#5b8def; --user:#23314d; --bot:#262a31; --rec:#ef4444; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui, sans-serif; }
+  main { max-width:760px; margin:0 auto; padding:16px; display:grid; gap:12px; }
+  .card { background:var(--card); border-radius:12px; padding:14px; box-shadow:0 1px 3px rgba(0,0,0,.12); }
+  h1 { font-size:18px; margin:0; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:end; }
+  label { display:grid; gap:4px; font-size:12px; color:var(--muted); }
+  select, input[type=text], button { font:inherit; padding:8px 10px; border-radius:8px; border:1px solid #8884; background:var(--card); color:var(--text); }
+  input[type=range] { width:140px; }
+  button { cursor:pointer; }
+  button.primary { background:var(--accent); color:#fff; border-color:transparent; }
+  button.rec { background:var(--rec); color:#fff; border-color:transparent; }
+  button:disabled { opacity:.5; cursor:default; }
+  #log { display:grid; gap:8px; min-height:240px; max-height:50vh; overflow:auto; align-content:start; }
+  .msg { padding:8px 12px; border-radius:10px; max-width:85%; white-space:pre-wrap; }
+  .msg.user { background:var(--user); justify-self:end; }
+  .msg.bot { background:var(--bot); justify-self:start; }
+  #status { color:var(--muted); font-size:13px; min-height:20px; }
+  #text { flex:1; min-width:200px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Voice Chat — Kotoba-Whisper → LLM → Style-Bert-VITS2</h1>
+
+  <section class="card row">
+    <label>TTS model
+      <select id="model"></select>
+    </label>
+    <label>Style
+      <select id="style"></select>
+    </label>
+    <label>Style weight: <span id="swv">5.0</span>
+      <input id="sw" type="range" min="0" max="20" step="0.5" value="5">
+    </label>
+    <label>Length (speed): <span id="lenv">1.0</span>
+      <input id="len" type="range" min="0.6" max="1.6" step="0.05" value="1">
+    </label>
+    <button id="reset">Reset chat</button>
+  </section>
+
+  <section class="card"><div id="log"></div></section>
+
+  <section class="card">
+    <div class="row">
+      <button id="mic" class="primary">🎤 Start recording</button>
+      <input id="text" type="text" placeholder="…or type a message and press Enter">
+      <button id="send">Send</button>
+    </div>
+    <div id="status"></div>
+    <audio id="player" controls hidden></audio>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let models = [], recorder = null, chunks = [], busy = false;
+
+const setStatus = s => $("status").textContent = s;
+const addMsg = (who, text) => {
+  const d = document.createElement("div");
+  d.className = "msg " + who; d.textContent = text;
+  $("log").append(d); $("log").scrollTop = $("log").scrollHeight;
+};
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error((await r.text()).slice(0, 300));
+  return r;
+}
+
+async function loadModels() {
+  models = await (await api("/api/models")).json();
+  $("model").innerHTML = models.map(m => `<option value="${m.id}">${m.name} — ${m.checkpoint}</option>`).join("");
+  const saved = localStorage.getItem("sbv2_model");
+  if (saved && models.some(m => m.id === saved)) $("model").value = saved;
+  fillStyles();
+}
+function fillStyles() {
+  const m = models.find(m => m.id === $("model").value);
+  $("style").innerHTML = (m ? m.styles : []).map(s => `<option>${s}</option>`).join("");
+}
+$("model").onchange = () => { localStorage.setItem("sbv2_model", $("model").value); fillStyles(); };
+$("sw").oninput = () => $("swv").textContent = (+$("sw").value).toFixed(1);
+$("len").oninput = () => $("lenv").textContent = (+$("len").value).toFixed(2);
+
+async function speak(text) {
+  setStatus("Synthesizing voice…");
+  const r = await api("/api/tts", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({ text, model: $("model").value, style: $("style").value,
+                           style_weight: +$("sw").value, length: +$("len").value }),
+  });
+  const url = URL.createObjectURL(await r.blob());
+  $("player").src = url;
+  try {
+    await $("player").play();
+  } catch (e) {
+    if (e.name !== "NotAllowedError") throw e;
+    // Autoplay still blocked: show the player so the reply can be played manually.
+    $("player").hidden = false;
+    setStatus("Browser blocked autoplay — press play below. (Allow autoplay for this site to avoid this.)");
+    throw new Error("autoplay blocked");
+  }
+}
+
+// Play a silent clip inside a click handler so the browser lets later playback through.
+const SILENT_WAV = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=";
+function unlockAudio() {
+  const a = $("player");
+  a.src = SILENT_WAV;
+  a.play().catch(() => {});
+}
+
+async function chatTurn(text) {
+  addMsg("user", text);
+  setStatus("Thinking…");
+  const r = await (await api("/api/chat", {
+    method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ text }),
+  })).json();
+  addMsg("bot", r.reply);
+  await speak(r.reply);
+}
+
+async function run(fn) {
+  if (busy) return;
+  busy = true; $("mic").disabled = $("send").disabled = true;
+  try { await fn(); setStatus(""); }
+  catch (e) { if (e.message !== "autoplay blocked") setStatus("Error: " + e.message); }
+  finally { busy = false; $("mic").disabled = $("send").disabled = false; }
+}
+
+$("send").onclick = () => {
+  const t = $("text").value.trim(); if (!t) return;
+  unlockAudio();
+  $("text").value = ""; run(() => chatTurn(t));
+};
+$("text").onkeydown = e => { if (e.key === "Enter" && !e.isComposing) $("send").click(); };
+
+$("mic").onclick = async () => {
+  unlockAudio();
+  if (recorder) { recorder.stop(); return; }
+  if (busy) return;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    recorder = new MediaRecorder(stream); chunks = [];
+    recorder.ondataavailable = e => chunks.push(e.data);
+    recorder.onstop = () => {
+      stream.getTracks().forEach(t => t.stop());
+      const blob = new Blob(chunks, { type: recorder.mimeType });
+      recorder = null;
+      $("mic").textContent = "🎤 Start recording"; $("mic").className = "primary";
+      run(async () => {
+        setStatus("Transcribing…");
+        const fd = new FormData(); fd.append("audio", blob, "rec.webm");
+        const { text } = await (await api("/api/asr", { method: "POST", body: fd })).json();
+        if (!text) { setStatus("Nothing heard."); return; }
+        await chatTurn(text);
+      });
+    };
+    recorder.start();
+    $("mic").textContent = "⏹ Stop & send"; $("mic").className = "rec";
+    setStatus("Recording…");
+  } catch (e) { setStatus("Mic error: " + e.message); }
+};
+
+$("reset").onclick = async () => {
+  await api("/api/reset", { method: "POST" }); $("log").innerHTML = ""; setStatus("Chat reset.");
+};
+
+loadModels().catch(e => setStatus("Could not load models: " + e.message));
+</script>
+</body>
+</html>

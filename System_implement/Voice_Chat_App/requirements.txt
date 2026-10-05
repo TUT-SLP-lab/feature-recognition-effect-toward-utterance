@@ -1,0 +1,23 @@
+fastapi
+uvicorn
+python-multipart
+soundfile
+google-genai
+fugashi
+transformers
+accelerate
+torch
+# Style-Bert-VITS2 inference deps (package itself is imported from ../Style-Bert-VITS2)
+onnxruntime
+pyopenjtalk-plus
+loguru
+cmudict
+g2p_en
+num2words
+pypinyin
+jieba
+cn2an
+pyworld-prebuilt
+pyloudnorm
+huggingface_hub
+safetensors
