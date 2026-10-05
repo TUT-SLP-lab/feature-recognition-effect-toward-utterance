@@ -1,4 +1,10 @@
-# Ryu: Japanese conversational adaptation research
+# feature-recognition-effect-toward-utterance
+
+相手の特徴認識が初に与える影響の調査に関する研究
+
+---
+
+## Ryu: Japanese conversational adaptation research
 
 Code for two linked pieces of research on how Japanese speakers adapt their speech to a
 conversation partner (gender and age), and whether an LLM can reproduce that behaviour.
