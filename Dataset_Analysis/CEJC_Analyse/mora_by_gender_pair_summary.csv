@@ -1,0 +1,4 @@
+gender_pair,num_conversations,total_mora,num_utterances,total_duration_seconds,avg_mora_per_conversation,avg_mora_per_utterance,mora_per_second
+F-F,47,192349,18473,28820.21,4092.53,10.41,6.67
+F-M,61,173089,17348,24998.99,2837.52,9.98,6.92
+M-M,27,123395,9477,17137.14,4570.19,13.02,7.2

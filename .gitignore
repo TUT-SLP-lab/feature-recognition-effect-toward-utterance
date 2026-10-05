@@ -1,0 +1,34 @@
+# excluded by choice
+/Corpus/
+/Research/
+/Research.worktrees/
+/System_implement/Style-Bert-VITS2/
+
+# environments and local config
+.venv/
+.venv-*/
+.claude/
+.env*
+
+# generated files
+__pycache__/
+*.pyc
+*.log
+*.bak
+.ipynb_checkpoints/
+.DS_Store
+
+# Dataset_Analysis: ignore generated output, but keep the plots
+# (use output/** rather than output/ so the re-include rules below can work)
+Dataset_Analysis/**/output/**
+!Dataset_Analysis/**/output/**/
+!Dataset_Analysis/**/output/**/*.png
+!Dataset_Analysis/**/output/**/*.svg
+
+# LLM_Response: still generating, ignore until final results are chosen
+System_implement/LLM_Response/outputs/
+
+# corpus-derived text that lives outside output/ (regenerate with the scripts)
+Dataset_Analysis/CEJC_Analyse/cleaned-data/
+Dataset_Analysis/CEJC_iiyodomi/utterances_with_filler*.csv
+Dataset_Analysis/LLM_SFP_comparison/*_result/

@@ -1,0 +1,10 @@
+# LLM_Response: direct dependencies only (Python 3.12).
+# Versions are the ones in System_implement/.venv-llm-response when this was written.
+# Exact full freeze (including transitive deps): requirements-lock.txt
+# Install: uv pip install -r requirements.txt   (or: pip install -r requirements.txt)
+
+google-genai==2.28.0   # Gemini client (from google import genai)
+fugashi==1.5.2         # MeCab wrapper, used to find the utterance-final particle
+unidic-lite==1.0.8     # dictionary for fugashi
+pandas==3.0.6          # Response_All_AI_weight_random.py (counter mode)
+matplotlib==3.11.2     # Response_All_AI_weight_random.py (charts)

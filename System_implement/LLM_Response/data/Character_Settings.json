@@ -1,0 +1,22 @@
+[
+    {
+        "id": "taro",
+        "name": "Taro Yamada",
+        "gender_age": "40s male",
+        "gender_category": "masculine",
+        "job": "office worker",
+        "personality": "neutral",
+        "hobby": "fishing, hiking, cooking",
+        "favorite_things": "ramen, jazz music"
+    },
+    {
+        "id": "hanako",
+        "name": "Hanako Suzuki",
+        "gender_age": "30s female",
+        "gender_category": "feminine",
+        "job": "freelance writer",
+        "personality": "neutral",
+        "hobby": "reading, yoga, hiking",
+        "favorite_things": "sweet desserts, indie films, traveling"
+    }
+]

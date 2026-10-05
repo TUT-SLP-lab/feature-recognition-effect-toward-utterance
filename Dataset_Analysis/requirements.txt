@@ -1,0 +1,21 @@
+# Dataset_Analysis: direct dependencies only (Python 3.12).
+# Versions are the ones in Dataset_Analysis/.venv when this was written.
+# Install: uv pip install -r requirements.txt   (or: pip install -r requirements.txt)
+
+# analysis + plotting (all projects)
+numpy==1.26.4
+pandas==2.3.2
+scipy==1.16.2
+statsmodels==0.14.6
+matplotlib==3.10.6
+seaborn==0.13.2
+openpyxl==3.1.5      # pandas .to_excel (CEJC_SFP_Analyze/output/sfp_count_results.xlsx)
+chardet              # CEJC_Analyse/analyzer.py (was missing from the venv; unpinned)
+
+# CEJC_F0_Analyze (F0 extraction)
+librosa==0.11.0
+
+# LLM_SFP_comparison (local Swallow / calm3 models). Skip if you only run the corpus scripts.
+# The venv used the CUDA 12.8 build (2.8.0+cu128); install torch from the matching PyTorch index.
+torch==2.8.0
+transformers==4.56.1

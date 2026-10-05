@@ -1,0 +1,14 @@
+[
+    {
+        "id": "preset_a",
+        "personality": "neutral",
+        "hobby": "fishing, hiking, cooking",
+        "favorite_things": "ramen, jazz music"
+    },
+    {
+        "id": "preset_b",
+        "personality": "neutral",
+        "hobby": "reading, yoga, hiking",
+        "favorite_things": "sweet desserts, indie films, traveling"
+    }
+]
