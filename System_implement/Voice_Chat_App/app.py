@@ -6,12 +6,15 @@ Run:  python app.py   (then open http://localhost:8000)
 Needs GENAI_API_KEY in the environment (used by Response_weight_random).
 """
 
+import asyncio
 import io
 import json
 import os
 import subprocess
 import sys
 import threading
+import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import numpy as np
@@ -42,7 +45,15 @@ SBV2_BERT_ID = "ku-nlp/deberta-v2-large-japanese-char-wwm"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MAX_LOADED_TTS_MODELS = 2
 
-app = FastAPI(title="Voice Chat")
+@asynccontextmanager
+async def lifespan(_app):
+    # Load every model and run a dummy inference before the server accepts requests,
+    # so the first real turn doesn't pay load / CUDA-warmup cost.
+    await asyncio.to_thread(warmup)
+    yield
+
+
+app = FastAPI(title="Voice Chat", lifespan=lifespan)
 _gpu_lock = threading.Lock()  # ASR / TTS / LLM share one GPU; keep requests serial
 
 
@@ -140,6 +151,37 @@ class TTSRequest(BaseModel):
     style: str = "Neutral"
     style_weight: float = 5.0
     length: float = 1.0  # >1.0 slower
+
+
+# ---------------- Warm-up ----------------
+def warmup():
+    """Each step is independent and non-fatal: a failure just means that component loads lazily later."""
+    def step(name, fn):
+        t0 = time.perf_counter()
+        try:
+            fn()
+            print(f"[warmup] {name} ready ({time.perf_counter() - t0:.1f}s)")
+        except Exception as e:
+            print(f"[warmup] {name} skipped: {e!r}")
+
+    def asr():
+        with _gpu_lock:
+            get_asr()({"raw": np.zeros(16000, dtype=np.float32), "sampling_rate": 16000},
+                      generate_kwargs={"language": "ja", "task": "transcribe"})
+
+    def tts():
+        models = list_tts_models()
+        model_id = os.environ.get("TTS_MODEL") or models[0]["id"]
+        with _gpu_lock:
+            get_tts(model_id).infer(text="こんにちは", language=Languages.JP)
+
+    def llm():
+        chatbot.get_tagger()("こんにちは")
+        chatbot.get_client().models.generate_content(model=chatbot.MODEL, contents="こんにちは")
+
+    step("ASR", asr)
+    step("TTS", tts)
+    step("LLM", llm)
 
 
 @app.get("/api/models")
