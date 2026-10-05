@@ -2,9 +2,11 @@
 
 相手の特徴認識が初に与える影響の調査に関する研究
 
+English below / [日本語はこちら](#日本語)
+
 ---
 
-## Ryu: Japanese conversational adaptation research
+## Japanese conversational adaptation research
 
 Code for two linked pieces of research on how Japanese speakers adapt their speech to a
 conversation partner (gender and age), and whether an LLM can reproduce that behaviour.
@@ -94,3 +96,93 @@ python Response_All_AI_weight_random.py --mode counter
 
 - The Gemini model name (`gemini-3.5-flash-lite`) is hard-coded in the scripts; change it there if it is retired.
 - Mixing results from different taxonomy files (`SFP_Bucket_by_gender*.json`) will change the numbers; check which file a script loads before comparing runs.
+
+---
+
+## 日本語
+
+[English](#japanese-conversational-adaptation-research)
+
+### 概要
+
+日本語話者が会話相手(性別・年齢)に合わせて話し方をどう変えるか、そして LLM がその振る舞いを再現できるかを調べる、2つの研究のコードです。
+
+| フォルダ | 内容 |
+|---|---|
+| [Dataset_Analysis/](Dataset_Analysis/) | CEJC と NUCC(名大会話コーパス)の分析。終助詞(SFP)、一人称代名詞、F0、話速、フィラー、モーラ数。LLM による変換発話の比較も含む。 |
+| [System_implement/LLM_Response/](System_implement/LLM_Response/) | 性別・年齢のプロファイルに応じて終助詞・代名詞の使い方を制御した、Gemini 同士のペルソナ会話生成。実際に使われた終助詞を分類するカウンター付き。 |
+| [System_implement/jvs_to_esd.py](System_implement/jvs_to_esd.py) | JVS の話者を Style-Bert-VITS2 の学習用形式に変換するスクリプト。 |
+
+### このリポジトリに含まれないもの
+
+このリポジトリにはコード、小さなデータファイル、図のみを置いています。以下は意図的に除外しています([.gitignore](.gitignore) 参照)。
+
+- `Corpus/`(CEJC、NUCC、BTSJ、JVS): 生のコーパスは容量が大きく、再配布が制限されているため含めていません。**各自で入手してください。**
+- `Research/` と `System_implement/Style-Bert-VITS2/`: 別プロジェクトとモデルの重みファイル。
+- 仮想環境(`.venv*`)、キャッシュ、ログ。
+- `Dataset_Analysis/**/output/` 配下のうち**図(`.png` / `.svg`)以外**。CSV/HTML/JSON の結果はスクリプトを実行すると再生成されます。
+- `Dataset_Analysis/CEJC_Analyse/cleaned-data/`、`CEJC_iiyodomi/utterances_with_filler*.csv`、`LLM_SFP_comparison/*_result/`: コーパスの発話テキストを含むため除外。
+- `System_implement/LLM_Response/outputs/`: 生成した会話ログ。実験中のため除外しています。最終結果は `git add -f` で追加できます。
+
+### セットアップ
+
+Python 3.12。プロジェクトごとに requirements ファイルがあります。
+
+```bash
+# Dataset_Analysis
+cd Dataset_Analysis
+uv venv .venv && uv pip install -r requirements.txt     # または: python -m venv .venv && pip install -r requirements.txt
+
+# LLM_Response
+cd System_implement/LLM_Response
+uv venv ../.venv-llm-response && uv pip install -r requirements.txt
+# バージョンを完全に再現したい場合は requirements-lock.txt を使用
+```
+
+`torch` / `transformers` は `LLM_SFP_comparison`(ローカルの Swallow、calm3 モデル)でのみ必要です。CUDA のバージョンに合う `torch` を入れてください。
+
+**パスは固定(ハードコード)されています。** 多くのスクリプトは `/home/ryuu/Ryu/Corpus/CEJC` や `/home/ryuu/Ryu/Corpus/nucc/Himawari_nucc/Himawari_meidai` のような絶対パスを使っています。プロジェクトとコーパスを `/home/ryuu/Ryu/` に置くか、各スクリプト冒頭のパス定数を書き換えてください。
+
+### Dataset_Analysis
+
+各サブフォルダが1つの分析です。スクリプトは隣の `output/` フォルダに結果を書き出します。
+
+| フォルダ | スクリプト | 分析内容 |
+|---|---|---|
+| `CEJC_Analyse/` | `data_cleaner.py`, `speaker_log_mapping.py`, `analyzer.py` | 書き起こしのクリーニング、話者と会話の対応付け(有効/除外)、話者別・性別ペア別のモーラ数の集計。他のスクリプトはここで作るクリーニング済みデータと対応表に依存します。 |
+| `CEJC_SFP_Analyze/` | `SFP_counter.py`, `SFP_counter_AI.py`, `SFP_speaker_shift.py` | CEJC の終助詞のカウント、LLM による性差の強さ(バケット)分類、一人の話者の会話ごとの終助詞の変化の可視化。 |
+| `CEJC_pronoun/` | `CEJC_pronoun_analysis.py` | 話者・相手別の一人称代名詞の使用。 |
+| `CEJC_F0_Analyze/` | `CEJC_F0.py`, `CEJC_DynamicRange.py` | 相手への ΔF0 とF0ダイナミックレンジの適応。 |
+| `CEJC_tempo/` | `CEJC_tempo.py` | ΔTempo(話速)の適応。 |
+| `CEJC_iiyodomi/` | `CEJC_iiyodomi_analysis.py`, `..._relation_analysis.py`, `..._graphs.py` | 性別・年齢・関係性ごとのフィラー(言いよどみ)の頻度。この順に実行します。 |
+| `nucc_analysis/` | `nucc_SFP_analysis.py`, `nucc_pronoun_analysis.py` | 名大会話コーパスでの同様の終助詞・代名詞分析。 |
+| `LLM_SFP_comparison/` | `gemini_test.py`, `Llama-3-Swallow.py`, `calm3-22b-chat.py` | CEJC の発話を目標話者のプロファイルに合わせて各 LLM で変換し、終助詞を比較。 |
+| `BTSJ_Analysis/` | `BTSJ_SFP.py` | プレースホルダー(空ファイル)。 |
+
+時間のかかる処理は多くのスクリプトでキャッシュされ(`*_cache.json`、`ai_cache/`)、中断しても再開できます。最初からやり直す場合はキャッシュを削除してください。
+
+### LLM_Response
+
+Gemini が演じる2人のキャラクターが会話します。各ターンで、[data/](System_implement/LLM_Response/data/) の分類表から目標とする終助詞・代名詞・呼称のカテゴリを選び、モデルに与えます。
+
+```bash
+export GENAI_API_KEY=...        # 必須。コミットしないこと
+cd System_implement/LLM_Response/src
+
+# 1ペア、30ターン
+python Response_All_AI_weight_random.py --mode generate --age-a 20s --gender-a male --age-b 20s --gender-b female --turns 30
+# 同上 + ターンごとの終助詞分類をリアルタイム表示
+python Response_All_AI_weight_random.py --mode debug --age-a 20s --gender-a male --age-b 20s --gender-b female
+# 保存済みの会話を再分類し、実行間で比較するグラフを作成
+python Response_All_AI_weight_random.py --mode counter
+```
+
+- `Response_All_AI_weight_random.py` が最新版です(重み付きランダムでカテゴリを選び、次に強さを選ぶ)。全オプションは `--help` で確認できます。年齢・性別のオプションを省略すると全組み合わせを順に実行します。
+- それ以外の `Response*.py` は過去の版で、参考のために残しています(`_v1`、`_no_random`、`_RatioInPrompt`、`Response.py`、`Response_v1_fixBucket.py`)。
+- `data/`: キャラクター設定、ペルソナのプリセット、終助詞・代名詞・呼称の分類表(`*_kaExclude*` は終助詞「か」を除いた版)。
+- 出力先は `outputs/chat_logs/<タイムスタンプ>/`(会話ログ)と `outputs/sfp_ai_output/`(分類結果とグラフ)です。
+
+### 注意
+
+- Gemini のモデル名(`gemini-3.5-flash-lite`)はスクリプト内に直接書かれています。提供終了した場合はそこを書き換えてください。
+- 分類表(`SFP_Bucket_by_gender*.json`)が違うと数値が変わります。実行結果を比較する前に、どのファイルを読み込んでいるか確認してください。
