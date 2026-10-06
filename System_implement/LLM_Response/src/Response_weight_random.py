@@ -68,7 +68,9 @@ SFP_INTENSITY_WEIGHTS_BY_CATEGORY = {
 
 # Toggles for the named anti-attractor bans in build_persona_instruction.
 ENABLE_NANDA_BAN = True
-ENABLE_WA_BAN = False
+ENABLE_WA_BAN = True  # re-enabled: with it off, strongly_feminine (わ/のよね/かしら family)
+                      # dominated feminine-category usage, mostly drifting from moderately_
+                      # feminine/neutral rolls rather than being legitimately rolled
 
 SFP_ENFORCE_MAX_ATTEMPTS = 3
 
@@ -80,6 +82,15 @@ PIVOT_STRATEGIES = [
     "Agree with or build on a specific detail they mentioned, then add a new detail of your own.",
     "Pivot naturally to a loosely related new topic.",
     "Just react briefly to what they said with a short comment or reaction; no need to pivot or add new information this turn.",
+]
+# Short labels for debug output, index-matched to PIVOT_STRATEGIES.
+PIVOT_STRATEGY_LABELS = [
+    "follow_up_question",
+    "share_experience",
+    "mild_disagreement",
+    "agree_and_add",
+    "new_topic",
+    "brief_reaction",
 ]
 
 client = None
@@ -191,9 +202,9 @@ def build_sfp_instruction(t_cat):
         )
 
     # んだ/だよ-family is a strong default habit for this model; name and ban it outright.
-    nanda_ban = ""
+    nanda_control = ""
     if ENABLE_NANDA_BAN and primary_tier not in ("moderately_masculine", "strongly_masculine"):
-        nanda_ban = (
+        nanda_control = (
             "\nDo NOT default to だよ/だね/だよね/だな/だろ/だろう/んだ/んだよ/んだね/んだよね as a generic sentence "
             "ending this turn — ALL of these (not just the んだ-contracted ones) are masculine-coded "
             "(moderately_masculine) and are not part of, or a safe substitute for, the list above. Attaching "
@@ -203,13 +214,15 @@ def build_sfp_instruction(t_cat):
         )
 
     # わ/わね/わよ/だわ/のよね is the mirror-image attractor.
-    wa_ban = ""
+    wa_control = ""
     if ENABLE_WA_BAN and primary_tier not in ("strongly_feminine",):
-        wa_ban = (
-            "\nDo NOT default to わ/わね/わよ/わよね/だわ/のよね as a generic sentence ending this turn — these "
-            "are strongly feminine-coded and are not part of, or a safe substitute for, the list above. This "
-            "is a common habit to fall back on as a stereotypical \"feminine\" voice, but it is off-register "
-            "here; use one of the listed particles instead, or no particle at all, rather than these forms."
+        wa_control = (
+            "\nDo NOT default to わ/わね/わよ/わよね/だわ/だったわ/のよ/のよね/かしら/のかしら/のかしらね (or any "
+            "ちゃう-contracted form of these, e.g. ちゃうわ/ちゃうのよね) as a generic sentence ending this turn — "
+            "ALL of these are strongly feminine-coded and are not part of, or a safe substitute for, the list "
+            "above. This is a common habit to fall back on as a stereotypical \"feminine\" voice, but it is "
+            "off-register here; use one of the listed particles instead, or no particle at all, rather than "
+            "any of these forms."
         )
 
     sfp_inst = (
@@ -221,7 +234,7 @@ def build_sfp_instruction(t_cat):
         "are NOT interchangeable: よね (plain) vs だよね (copula added) are different registers; ね vs だね are "
         "different registers; んだよね and んだね already contain だ as part of the listed entry itself, so "
         "they are a different, more casual/masculine-leaning form than plain よね/ね and must NOT be used as a "
-        f"substitute when よね/ね (without だ/んだ) is what's listed above.{intensity_warning}{nanda_ban}{wa_ban}\n"
+        f"substitute when よね/ね (without だ/んだ) is what's listed above.{intensity_warning}{nanda_control}{wa_control}\n"
         f"Only reach for a different ending if every option in that list above would sound distinctly "
         f"unnatural for this specific sentence.{fallback_clause} If nothing in this entire fallback order "
         "would sound natural either, simply end the sentence without any sentence-final particle this turn, "
@@ -360,7 +373,7 @@ def _attempt_rank(attempt, rolled_cat):
 # ==============================================================
 
 def build_persona_instruction(target, opp, opp_style):
-    """Returns (system_instruction, rolled_cat, rolled_tier)."""
+    """Returns (system_instruction, rolled_cat, rolled_tier, pivot_strategy)."""
     t_cat, o_cat = get_category(target), get_category(opp)
 
     sfp_inst, rolled_cat, rolled_tier = build_sfp_instruction(t_cat)
@@ -372,6 +385,13 @@ def build_persona_instruction(target, opp, opp_style):
 
     personality = str(target.get("personality", "")).strip() or "neutral"
     pivot_strategy = random.choice(PIVOT_STRATEGIES)
+    # Pivot guidance goes second, right after SFP: it has no retry backstop, so position is
+    # its only lever. No blanket "don't end every turn with a question" rule — it contradicted
+    # the follow-up-question strategy; each strategy fully specifies its own turn behavior.
+    pivot_inst = (
+        f"For this turn, react using this approach: {pivot_strategy} "
+        "Do not overuse the pattern '[topic] wa ii kedo, watashi/boku wa [other topic]' (e.g. '〜もいいけど、私は〜') — if you used this phrasing recently, use a different approach this turn. "
+    )
 
     return (
         f"You are {target['name']}, a {target['gender_age']} {target['job']}. "
@@ -385,6 +405,7 @@ def build_persona_instruction(target, opp, opp_style):
         "Respond naturally in character, as this persona would, based on the conversation so far.\n"
         # SFP guidance comes right after the persona intro, ahead of the general style rules.
         f"{sfp_inst}\n"
+        f"{pivot_inst}\n"
         f"{pron_inst}{kosh_inst}\n"
         "CRITICAL: Do not invent or assume any background details about the user's current situation, schedule, or life (e.g., do not assume they are working, studying, or on a break). "
         "At the start of the conversation, if the user only gives a short greeting, introduce yourself naturally and ask a broad, safe icebreaker—like asking for their name, or try to engage them for self introduction. "
@@ -392,14 +413,10 @@ def build_persona_instruction(target, opp, opp_style):
         "Keep your response short, one or two short "
         "sentences at most, not a lengthy reply. Have some follow up questions "
         "or comments to keep the conversation going, but don't ask more than one question at a time. "
-        "Do not end every turn with a question. "
-        "If you asked a question in your previous turn, just react to the user's answer and share something about your own hobbies or feelings this turn. "
         "When you do share about yourself, link it naturally to what the user just said. "
         "When you pivot to a new angle or topic, briefly acknowledge what the user just said first, rather than ignoring it and asserting an unrelated topic in parallel. "
-        f"For this turn, react using this approach: {pivot_strategy} "
-        "Do not overuse the pattern '[topic] wa ii kedo, watashi/boku wa [other topic]' (e.g. '〜もいいけど、私は〜') — if you used this phrasing recently, use a different approach this turn. "
         "Every few turns, you may circle back to something mentioned earlier in the conversation instead of only introducing new topics."
-    ), rolled_cat, rolled_tier
+    ), rolled_cat, rolled_tier, pivot_strategy
 
 
 def summarize_history(summary, style, pronoun_choice, koshou_choice, aged_turns):
@@ -434,7 +451,8 @@ def summarize_history(summary, style, pronoun_choice, koshou_choice, aged_turns)
 def generate_response(state, user_input, debug_sfp=False):
     state["recent"].append({"role": "user", "parts": [{"text": user_input}]})
 
-    sys_inst, rolled_cat, rolled_tier = build_persona_instruction(TARGET_PROFILE, OPPONENT_PROFILE, state["opponent_style"])
+    sys_inst, rolled_cat, rolled_tier, pivot_strategy = build_persona_instruction(TARGET_PROFILE, OPPONENT_PROFILE, state["opponent_style"])
+    pivot_label = PIVOT_STRATEGY_LABELS[PIVOT_STRATEGIES.index(pivot_strategy)]
     if p := state.get("pronoun_choice"):
         sys_inst += f" Established self-reference pronoun: {p}. Use this exact pronoun consistently and do not switch forms."
     if k := state.get("koshou_choice"):
@@ -462,7 +480,7 @@ def generate_response(state, user_input, debug_sfp=False):
     final = max(attempts, key=lambda a: _attempt_rank(a, rolled_cat))
     reply = final["reply"]
     if debug_sfp:
-        print(f"[SFP DEBUG] rolled={rolled_cat} rolled_tier={rolled_tier} "
+        print(f"[SFP DEBUG] rolled={rolled_cat} rolled_tier={rolled_tier} pivot={pivot_label} "
               f"used_particle={final['used_particle'] or '(none)'} used_tier={final['used_tier']} "
               f"attempts={len(attempts)}")
 
