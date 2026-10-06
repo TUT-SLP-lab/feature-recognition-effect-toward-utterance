@@ -276,6 +276,17 @@ PIVOT_STRATEGIES = [
     "Pivot naturally to a loosely related new topic.",
     "Just react briefly to what they said with a short comment or reaction; no need to pivot or add new information this turn.",
 ]
+# Short, stable labels for debug logging — index-matched to PIVOT_STRATEGIES, so
+# the debug CSV/print line can show which strategy rolled without repeating the
+# full sentence on every row.
+PIVOT_STRATEGY_LABELS = [
+    "follow_up_question",
+    "share_experience",
+    "mild_disagreement",
+    "agree_and_add",
+    "new_topic",
+    "brief_reaction",
+]
 
 RECENT_ENDINGS_KEPT = 3
 ENDING_FINGERPRINT_CHARS = 10
@@ -482,18 +493,22 @@ def build_persona_instruction(target, opponent, pronoun_lock=None, koshou_lock=N
         )
 
     pivot_strategy = random.choice(PIVOT_STRATEGIES)
-    # The "don't end every turn with a question" caveat used to be a blanket rule
-    # applied on every single turn — including turns where this same roll picked
-    # the "ask a follow-up question" strategy, directly contradicting it. Measured
-    # question-mark rate came out near 1% of turns despite that strategy being
-    # rolled on ~1/6 of turns (~17%), a ~16x gap — the model was resolving the
-    # conflict by suppressing questions almost entirely. Only state the
-    # discouragement when this turn's roll isn't the question strategy.
-    question_pivot_rolled = pivot_strategy == PIVOT_STRATEGIES[0]
-    question_caveat = (
-        "" if question_pivot_rolled else
-        "Do not end every turn with a question, but you may ask one to naturally explore what the other person just said. "
-    )
+    # A blanket "don't end every turn with a question" rule used to live in the
+    # general conversational-style block below, applied unconditionally on every
+    # turn — including turns where this same roll picked PIVOT_STRATEGIES[0]
+    # ("ask a follow-up question"), directly contradicting it. Measured question-
+    # mark rate came out near 1% of turns despite that strategy being rolled on
+    # ~1/6 of turns (~17%), a ~16x gap — the model was resolving the conflict by
+    # suppressing questions almost entirely. A runtime special-case
+    # (question_pivot_rolled) patched the symptom by suppressing the line only on
+    # question-strategy turns, but that meant one specific PIVOT_STRATEGIES entry
+    # needed cross-cutting logic reaching into an unrelated part of the prompt —
+    # asymmetric with the other 5 strategies, which are each a single self-
+    # contained sentence needing no such patching. Removed instead: the whole-
+    # chunk pivot design means each of the 6 strategies should fully specify its
+    # own turn behavior; PIVOT_STRATEGIES[0] already says "ask a follow-up
+    # question" and needs no caveat undoing it.
+    # "Do not end every turn with a question, but you may ask one to naturally explore what the other person just said. "
 
     if recent_endings:
         endings_list = "、".join(f"「{e}」" for e in recent_endings)
@@ -501,16 +516,21 @@ def build_persona_instruction(target, opponent, pronoun_lock=None, koshou_lock=N
     else:
         repetition_inst = ""
 
-    # SFP/pronoun/address-form guidance is placed right after the persona intro,
-    # ahead of the general conversational-style rules below — these are the
-    # per-turn constraints we most need the model to actually follow (especially
-    # the weighted-roll SFP targeting), and testing across model sizes suggested
+    # SFP guidance is placed right after the persona intro — the per-turn
+    # constraint we most need followed, and testing across model sizes suggested
     # a smaller/weaker model's prompt-following degrades for instructions buried
-    # after a long preamble of less critical stylistic guidance (the classic
-    # "lost in the middle" effect, worse on weaker models). The general style
-    # rules (pivot strategy, don't-parrot, don't-yes-man, etc.) are important for
-    # naturalness but tolerate occasional misses far better than SFP compliance
-    # does, so they now come after the hard constraints instead of surrounding them.
+    # after a long preamble (the classic "lost in the middle" effect, worse on
+    # weaker models). SFP can afford to still lead even so, since its retry/
+    # best-of-N enforcement mechanism (see generate_reply) corrects much of what
+    # raw prompt compliance misses. Pivot strategy has no such backstop — position
+    # is the only lever available for it — so it gets second priority, stated
+    # right after SFP and ahead of pronoun/address-form guidance and the general
+    # conversational-style rules (don't-parrot, don't-yes-man, etc.), which
+    # tolerate occasional misses far better than either of these two do.
+    pivot_inst = (
+        f"For this turn, react using this approach: {pivot_strategy} "
+        "Do not overuse the pattern '[topic] wa ii kedo, watashi/boku wa [other topic]' (e.g. '〜もいいけど、私は〜') — if you used this phrasing recently, use a different approach this turn. " #prevent having the same pivot pattern every turn
+    )
     return (
         f"You are a {target['gender_age']}. "
         f"You are talking with a {opponent['gender_age']}."
@@ -518,21 +538,19 @@ def build_persona_instruction(target, opponent, pronoun_lock=None, koshou_lock=N
         "The topic of the conversation is travel and leisure activities. "
         "Respond naturally in character, as this persona would, based on the conversation so far.\n"
         f"{sfp_inst}\n"
+        f"{pivot_inst}\n"
         f"{pron_inst}{kosh_inst}\n"
         "CRITICAL: Do not invent or assume any background details about the other character's situation, schedule, or life. "
         "If the conversation is just starting, introduce yourself naturally and ask a broad, safe icebreaker. "
         "Always respond in Japanese only, regardless of what language the other character uses. "
         "Keep your response short, one or two short sentences at most. "
-        f"{question_caveat}"
         "Avoid simply agreeing with or complimenting what the other person said (e.g. do not just say it sounds nice/wonderful/great). " #prevent yes-man responses
         "When you pivot to a new angle or topic, briefly acknowledge what the other person just said first, rather than ignoring it and asserting an unrelated topic in parallel. "
-        f"For this turn, react using this approach: {pivot_strategy} "
-        "Do not overuse the pattern '[topic] wa ii kedo, watashi/boku wa [other topic]' (e.g. '〜もいいけど、私は〜') — if you used this phrasing recently, use a different approach this turn. " #prevent having the same pivot pattern every turn
         "Every few turns, you may circle back to something mentioned earlier in the conversation instead of only introducing new topics. "
         "Do not repeat or re-name the specific topic word/noun the other person just introduced back to them before reacting (e.g. if they say '動物のやつが好き', don't reply starting with '動物モチーフだと〜'; if they mention '足湯', don't reply starting with '足湯は〜') — just react to the substance directly without restating the keyword. " #prevent parrotting
         f"{repetition_inst}"
         #"When you do share about yourself, link it naturally to what the other character just said. "
-    ), rolled_cat, primary_tier, sfp_pool
+    ), rolled_cat, primary_tier, sfp_pool, pivot_strategy
 
 
 def transcript_text_for_speaker(turns, current_speaker_id):
@@ -625,8 +643,9 @@ def _attempt_rank(attempt, rolled_cat):
 
 
 def generate_reply(speaker, opponent, turns, pronoun_lock=None, koshou_lock=None, recent_endings=None, debug_sfp=False):
-    system_instruction, rolled_cat, rolled_tier, sfp_pool = build_persona_instruction(
+    system_instruction, rolled_cat, rolled_tier, sfp_pool, pivot_strategy = build_persona_instruction(
         speaker, opponent, pronoun_lock, koshou_lock, recent_endings)
+    pivot_label = PIVOT_STRATEGY_LABELS[PIVOT_STRATEGIES.index(pivot_strategy)]
 
     # Format transcript from 'speaker's point of view
     history = transcript_text_for_speaker(turns, speaker['id'])
@@ -692,6 +711,7 @@ def generate_reply(speaker, opponent, turns, pronoun_lock=None, koshou_lock=None
         debug_info = {
             "rolled_category": rolled_cat,
             "rolled_tier": rolled_tier,
+            "pivot_strategy": pivot_label,
             "used_particle": final["used_particle"],
             "used_tier": final["used_tier"],
             "used_category": final["used_category"],
@@ -701,6 +721,7 @@ def generate_reply(speaker, opponent, turns, pronoun_lock=None, koshou_lock=None
         }
         print(
             f"[SFP DEBUG] speaker={speaker['id']} rolled={rolled_cat} rolled_tier={rolled_tier} "
+            f"pivot={pivot_label} "
             f"used_particle={final['used_particle'] or '(none)'} used_tier={final['used_tier']} "
             f"used_category={final['used_category']} attempts={len(attempts)} "
             f"overall_s={overall_elapsed:.3f}"
@@ -723,8 +744,9 @@ def write_sfp_debug_csv(rows, output_path):
     with open(output_path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=["turn", "speaker_id", "rolled_category", "rolled_tier", "used_particle", "used_tier",
-                        "used_category", "attempts_used", "overall_generation_seconds", "attempt_elapsed_seconds"],
+            fieldnames=["turn", "speaker_id", "rolled_category", "rolled_tier", "pivot_strategy", "used_particle",
+                        "used_tier", "used_category", "attempts_used", "overall_generation_seconds",
+                        "attempt_elapsed_seconds"],
         )
         writer.writeheader()
         writer.writerows(rows)
