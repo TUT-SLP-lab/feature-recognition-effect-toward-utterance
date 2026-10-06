@@ -261,8 +261,12 @@ SFP_INTENSITY_WEIGHTS_BY_CATEGORY = {
 # which one is behind an observed drift pattern. Both default True (the normal,
 # intended behavior) — flip one off here to isolate its effect in a test run.
 ENABLE_NANDA_BAN = True
-ENABLE_WA_BAN = False  # disabled to test whether this specific ban is causing
-                       # male speakers to suppress feminine-rolled turns entirely
+ENABLE_WA_BAN = True  # re-enabled: with it off, strongly_feminine (わ/のよね/かしら
+                      # family) ended up dominating 83-93% of all feminine-category
+                      # usage for both speakers, nearly all drifted from moderately_
+                      # feminine/neutral rolls rather than legitimately rolled —
+                      # the earlier "suppresses feminine entirely" risk is being
+                      # weighed against this much larger, confirmed drift problem
 
 PIVOT_STRATEGIES = [
     "Ask a follow-up question about a specific detail in what the other person just said.",
@@ -408,9 +412,9 @@ def build_persona_instruction(target, opponent, pronoun_lock=None, koshou_lock=N
         # "don't add だ" rule wasn't specific enough to override this habit, so when
         # the rolled primary tier isn't itself moderately/strongly masculine, name
         # and ban this exact compound outright.
-        nanda_ban = ""
+        nanda_control = ""
         if ENABLE_NANDA_BAN and primary_tier not in ("moderately_masculine", "strongly_masculine"):
-            nanda_ban = (
+            nanda_control = (
                 "\nDo NOT default to だよ/だね/だよね/だな/だろ/だろう/んだ/んだよ/んだね/んだよね as a generic sentence "
                 "ending this turn — ALL of these (not just the んだ-contracted ones) are masculine-coded "
                 "(moderately_masculine) and are not part of, or a safe substitute for, the list above. Attaching "
@@ -425,13 +429,15 @@ def build_persona_instruction(target, opponent, pronoun_lock=None, koshou_lock=N
         # both retry attempts landing on them back-to-back, so retrying alone
         # couldn't escape it. Same fix as んだ-family: name and ban it outright
         # whenever it isn't actually the rolled tier.
-        wa_ban = ""
+        wa_control = ""
         if ENABLE_WA_BAN and primary_tier not in ("strongly_feminine",):
-            wa_ban = (
-                "\nDo NOT default to わ/わね/わよ/わよね/だわ/のよね as a generic sentence ending this turn — these "
-                "are strongly feminine-coded and are not part of, or a safe substitute for, the list above. This "
-                "is a common habit to fall back on as a stereotypical \"feminine\" voice, but it is off-register "
-                "here; use one of the listed particles instead, or no particle at all, rather than these forms."
+            wa_control = (
+                "\nDo NOT default to わ/わね/わよ/わよね/だわ/だったわ/のよ/のよね/かしら/のかしら/のかしらね (or any "
+                "ちゃう-contracted form of these, e.g. ちゃうわ/ちゃうのよね) as a generic sentence ending this turn — "
+                "ALL of these are strongly feminine-coded and are not part of, or a safe substitute for, the list "
+                "above. This is a common habit to fall back on as a stereotypical \"feminine\" voice, but it is "
+                "off-register here; use one of the listed particles instead, or no particle at all, rather than "
+                "any of these forms."
             )
         sfp_inst = (
             f"Sentence-final particle guidance: prefer particles from this list ({sfps}) when you end a sentence "
@@ -442,7 +448,7 @@ def build_persona_instruction(target, opponent, pronoun_lock=None, koshou_lock=N
             "are NOT interchangeable: よね (plain) vs だよね (copula added) are different registers; ね vs だね are "
             "different registers; んだよね and んだね already contain だ as part of the listed entry itself, so "
             "they are a different, more casual/masculine-leaning form than plain よね/ね and must NOT be used as a "
-            f"substitute when よね/ね (without だ/んだ) is what's listed above.{intensity_warning}{nanda_ban}{wa_ban}\n"
+            f"substitute when よね/ね (without だ/んだ) is what's listed above.{intensity_warning}{nanda_control}{wa_control}\n"
             f"Only reach for a different ending if every option in that list above would sound distinctly "
             f"unnatural for this specific sentence.{fallback_clause} If nothing in this entire fallback order "
             "would sound natural either, simply end the sentence without any sentence-final particle this turn, "
@@ -476,6 +482,18 @@ def build_persona_instruction(target, opponent, pronoun_lock=None, koshou_lock=N
         )
 
     pivot_strategy = random.choice(PIVOT_STRATEGIES)
+    # The "don't end every turn with a question" caveat used to be a blanket rule
+    # applied on every single turn — including turns where this same roll picked
+    # the "ask a follow-up question" strategy, directly contradicting it. Measured
+    # question-mark rate came out near 1% of turns despite that strategy being
+    # rolled on ~1/6 of turns (~17%), a ~16x gap — the model was resolving the
+    # conflict by suppressing questions almost entirely. Only state the
+    # discouragement when this turn's roll isn't the question strategy.
+    question_pivot_rolled = pivot_strategy == PIVOT_STRATEGIES[0]
+    question_caveat = (
+        "" if question_pivot_rolled else
+        "Do not end every turn with a question, but you may ask one to naturally explore what the other person just said. "
+    )
 
     if recent_endings:
         endings_list = "、".join(f"「{e}」" for e in recent_endings)
@@ -505,7 +523,7 @@ def build_persona_instruction(target, opponent, pronoun_lock=None, koshou_lock=N
         "If the conversation is just starting, introduce yourself naturally and ask a broad, safe icebreaker. "
         "Always respond in Japanese only, regardless of what language the other character uses. "
         "Keep your response short, one or two short sentences at most. "
-        "Do not end every turn with a question, but you may ask one to naturally explore what the other person just said. "
+        f"{question_caveat}"
         "Avoid simply agreeing with or complimenting what the other person said (e.g. do not just say it sounds nice/wonderful/great). " #prevent yes-man responses
         "When you pivot to a new angle or topic, briefly acknowledge what the other person just said first, rather than ignoring it and asserting an unrelated topic in parallel. "
         f"For this turn, react using this approach: {pivot_strategy} "
@@ -565,7 +583,7 @@ def _classify_reply_sfp(cleaned, turns):
 
 # だ-copula sentence-final forms (だよ/だね/だよね/だな/だろ/だろう and their ん-contracted
 # counterparts んだ/んだよ/んだね/んだよね) are a persistent attractor for this model —
-# prompt bans alone (see nanda_ban in build_persona_instruction) weren't enough to
+# prompt bans alone (see nanda_control in build_persona_instruction) weren't enough to
 # stop it defaulting to these even when neither retry attempt was supposed to use
 # them, so _attempt_rank below also penalizes this pattern directly, to at least
 # prefer a DIFFERENT wrong-category attempt (if one happened to come up) over a
