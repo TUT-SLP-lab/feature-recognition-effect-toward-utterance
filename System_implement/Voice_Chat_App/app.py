@@ -207,7 +207,7 @@ def api_chat(req: ChatRequest):
     if not req.text.strip():
         raise HTTPException(400, "Empty text")
     with _gpu_lock:
-        reply = chatbot.generate_response(chat_state, req.text.strip())
+        reply = chatbot.generate_response(chat_state, req.text.strip(), debug_sfp=True)
     return {"reply": reply}
 
 

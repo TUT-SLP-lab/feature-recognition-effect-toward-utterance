@@ -12,6 +12,7 @@ weighted-random method from Response_All_AI_weight_random.py:
 import json
 import os
 import random
+import time
 from typing import Any, Dict, List, Optional
 
 import fugashi
@@ -81,7 +82,7 @@ PIVOT_STRATEGIES = [
     "Express a mild difference of opinion or preference, but phrase it in a fresh way rather than a simple 'X is fine, but I prefer Y' contrast.",
     "Agree with or build on a specific detail they mentioned, then add a new detail of your own.",
     "Pivot naturally to a loosely related new topic.",
-    "Just react briefly to what they said with a short comment or reaction; no need to pivot or add new information this turn.",
+    #"Just react briefly to what they said with a short comment or reaction; no need to pivot or add new information this turn.",
 ]
 # Short labels for debug output, index-matched to PIVOT_STRATEGIES.
 PIVOT_STRATEGY_LABELS = [
@@ -415,7 +416,9 @@ def build_persona_instruction(target, opp, opp_style):
         "or comments to keep the conversation going, but don't ask more than one question at a time. "
         "When you do share about yourself, link it naturally to what the user just said. "
         "When you pivot to a new angle or topic, briefly acknowledge what the user just said first, rather than ignoring it and asserting an unrelated topic in parallel. "
-        "Every few turns, you may circle back to something mentioned earlier in the conversation instead of only introducing new topics."
+        "Every few turns, you may circle back to something mentioned earlier in the conversation instead of only introducing new topics. "
+        "Avoid simply agreeing with or complimenting what the user said (e.g. do not just say it sounds nice/wonderful/great). " #prevent yes-man responses
+        "Do not repeat or re-name the specific topic word/noun the user just introduced back to them before reacting (e.g. if they say '動物のやつが好き', don't reply starting with '動物モチーフだと〜'; if they mention '足湯', don't reply starting with '足湯は〜') — just react to the substance directly without restating the keyword." #prevent parrotting
     ), rolled_cat, rolled_tier, pivot_strategy
 
 
@@ -463,26 +466,32 @@ def generate_response(state, user_input, debug_sfp=False):
     # Regenerate until the reply's final SFP lands on the rolled tier (no_sfp always
     # counts as a match — a plain ending is never wrong-gendered); otherwise keep the best attempt.
     attempts = []
+    overall_start = time.perf_counter()
     for attempt_num in range(1, SFP_ENFORCE_MAX_ATTEMPTS + 1):
+        attempt_start = time.perf_counter()
         reply = get_client().models.generate_content(
             model=MODEL,
             contents=state["recent"],
             config={"system_instruction": sys_inst},
         ).text.strip().replace("\n", " ")
         used_particle, used_tier, used_category = classify_reply_sfp(reply, state["recent"][:-1])
+        attempt_elapsed = time.perf_counter() - attempt_start
         attempts.append({
             "reply": reply, "used_particle": used_particle,
             "used_tier": used_tier, "used_category": used_category,
+            "elapsed": attempt_elapsed,
         })
         if used_tier == rolled_tier or used_category == "no_sfp":
             break
+    overall_elapsed = time.perf_counter() - overall_start
 
     final = max(attempts, key=lambda a: _attempt_rank(a, rolled_cat))
     reply = final["reply"]
     if debug_sfp:
+        attempt_times = ";".join(f"{a['elapsed']:.3f}" for a in attempts)
         print(f"[SFP DEBUG] rolled={rolled_cat} rolled_tier={rolled_tier} pivot={pivot_label} "
               f"used_particle={final['used_particle'] or '(none)'} used_tier={final['used_tier']} "
-              f"attempts={len(attempts)}")
+              f"attempts={len(attempts)} overall_s={overall_elapsed:.3f} attempt_s={attempt_times}")
 
     t_cat, o_cat = get_category(TARGET_PROFILE), get_category(OPPONENT_PROFILE)
     if not state.get("pronoun_choice"):
