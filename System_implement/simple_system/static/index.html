@@ -66,6 +66,9 @@
 
   <div id="view-chat">
   <section class="card row">
+    <label>LLM <small id="llm-note" style="color:var(--muted)"></small>
+      <select id="llm"></select>
+    </label>
     <label>TTS model
       <select id="model"></select>
     </label>
@@ -77,6 +80,9 @@
     </label>
     <label>Length (speed): <span id="lenv">1.0</span>
       <input id="len" type="range" min="0.6" max="1.6" step="0.05" value="1">
+    </label>
+    <label>Pause between sentences: <span id="pausev">250</span> ms
+      <input id="pause" type="range" min="0" max="1500" step="50" value="250">
     </label>
     <label>Mic threshold: <span id="thv">0.020</span>
       <input id="th" type="range" min="0.005" max="0.1" step="0.005" value="0.02">
@@ -97,6 +103,16 @@
       <div class="kv" id="live"></div>
     </section>
     <section class="card">
+      <h2 style="font-size:14px;margin:0 0 8px">LLM latency benchmark <small style="color:var(--muted)">— same prompts on every available LLM</small></h2>
+      <div class="row" style="align-items:center">
+        <label>Runs per prompt <input id="bench-reps" type="number" min="1" max="10" value="3" style="width:70px"></label>
+        <button id="bench-run" class="primary">▶ Run benchmark</button>
+        <span id="bench-status" style="color:var(--muted);font-size:13px"></span>
+      </div>
+      <div style="color:var(--muted);font-size:12px;margin:6px 0">Stop the conversation first (it shares the GPU). “First sentence” is what gates the voice; lower is better.</div>
+      <div id="bench-out"></div>
+    </section>
+    <section class="card">
       <h2 style="font-size:14px;margin:0 0 8px">Backchannel logging test <small style="color:var(--muted)">— no LLM</small></h2>
       <div class="row" style="align-items:center">
         <label style="display:flex;flex-direction:row;align-items:center;gap:6px;color:var(--text);font-size:14px">
@@ -114,13 +130,19 @@
         <input id="dbg-barge" type="number" min="0.3" max="5" step="0.1" value="1.0">
       </label>
       <label>End of speech silence (s)
-        <input id="dbg-end" type="number" min="0.3" max="3" step="0.1" value="1.0">
+        <input id="dbg-end" type="number" min="0.3" max="3" step="0.1" value="1.5">
+      </label>
+      <label>Start LLM early at silence (s)
+        <input id="dbg-spec-at" type="number" min="0.3" max="3" step="0.1" value="0.6">
+      </label>
+      <label style="flex-direction:row;align-items:center;gap:6px;color:var(--text);font-size:14px">
+        <input id="dbg-spec-on" type="checkbox" checked> Start LLM early (speculative reply)
       </label>
       <label>Filler “うん” at silence (s)
         <input id="dbg-filler-at" type="number" min="0.3" max="3" step="0.1" value="0.8">
       </label>
       <label style="flex-direction:row;align-items:center;gap:6px;color:var(--text);font-size:14px">
-        <input id="dbg-filler-on" type="checkbox" checked> Filler backchannel on pauses
+        <input id="dbg-filler-on" type="checkbox"> Filler backchannel on pauses
       </label>
     </section>
     <section class="card">
@@ -220,12 +242,21 @@ function reportClip(completed) {
   rec.chain = rec.chain.then(() => fetch("/api/play_event", { method: "POST", headers: {"Content-Type": "application/json"}, body })).catch(() => {});
 }
 $("player").onplaying = () => { if (cur && cur.start == null) cur.start = rec.total; };  // audio really started
-async function playNext() {
+// Silence between sentences = the page's pause + about 0.15 s left at the clip edges (the voice's own ~0.4 s padding is trimmed).
+let PAUSE_MS = 250, playEpoch = 0;
+try { const v = localStorage.getItem("pause_ms"); if (v !== null) PAUSE_MS = +v; } catch (e) {}
+async function playNext(fromEnded = false) {
   reportClip(true);
   const item = queue.shift();
   if (!item) { playing = false; idleWaiters.splice(0).forEach(f => f()); return; }
-  playing = true; cur = { id: item.id, start: null, filler: item.filler };
-  $("player").src = item.url; $("player").onended = playNext;
+  playing = true;
+  if (fromEnded && PAUSE_MS > 0) {  // between two sentences of the same reply (never before the first one)
+    const e = playEpoch;
+    await new Promise(r => setTimeout(r, PAUSE_MS));
+    if (e !== playEpoch) return;    // you interrupted during the pause
+  }
+  cur = { id: item.id, start: null, filler: item.filler };
+  $("player").src = item.url; $("player").onended = () => playNext(true);
   try { await $("player").play(); }
   catch (e) {
     if (e.name !== "NotAllowedError") return;  // pause() from stopPlayback
@@ -236,6 +267,7 @@ async function playNext() {
 }
 function stopPlayback() {
   if (cur) reportClip(false);  // cut off mid-clip: report how much was heard
+  playEpoch++;                 // also cancels a pause that is in progress
   queue.length = 0; playing = false; $("player").onended = null; $("player").pause();
   idleWaiters.splice(0).forEach(f => f());
 }
@@ -248,61 +280,131 @@ const idleStatus = () => listening ? "Listening…" : "";
 // Stop the bot: abort the running reply, drop queued audio, tell the server.
 function bargeIn() {
   epoch++;  // drops any filler that is still being fetched
+  cancelSpec();
   if (chatCtrl) { chatCtrl.abort(); chatCtrl = null; }
   stopPlayback();
   fetch("/api/interrupt", { method: "POST" }).catch(() => {});
 }
 
-async function chatTurn() {
-  const texts = unanswered.slice(), text = texts.join(""), ctrl = new AbortController();
-  chatCtrl = ctrl;
-  setStatus("Thinking…");
-  let bubble = null, buf = "", got = false;
-  const handle = line => {
-    if (!line.trim()) return;
-    const { text: sentence, audio, id } = JSON.parse(line);
-    if (!got) { got = true; unanswered.splice(0, texts.length); }  // answered (at least partly)
-    if (!bubble) { addMsg("bot", ""); bubble = $("log").lastChild; }
-    bubble.textContent += sentence; $("log").scrollTop = $("log").scrollHeight;
-    enqueue(URL.createObjectURL(new Blob([Uint8Array.from(atob(audio), c => c.charCodeAt(0))], { type: "audio/wav" })), id);
-    setStatus("Speaking…");
-  };
-  try {
+// ---------- streaming a reply (normal, or speculative while you pause) ----------
+function startStream(text, speculative) {
+  const s = { id: Math.random().toString(36).slice(2), text, speculative, committed: !speculative, ctrl: new AbortController(),
+              held: [], bubble: null, got: false, texts: unanswered.slice(), firstAt: null, t0: performance.now() };
+  s.promise = (async () => {
     const r = await api("/api/chat_stream", {
-      method: "POST", headers: {"Content-Type": "application/json"}, signal: ctrl.signal,
-      body: JSON.stringify({ text, test: $("dbg-test").checked, model: $("model").value, style: $("style").value,
-                             style_weight: +$("sw").value, length: +$("len").value }),
+      method: "POST", headers: {"Content-Type": "application/json"}, signal: s.ctrl.signal,
+      body: JSON.stringify({ text, speculative, spec_id: s.id, llm: $("llm").value, test: $("dbg-test").checked, model: $("model").value,
+                             style: $("style").value, style_weight: +$("sw").value, length: +$("len").value }),
     });
     const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = "";
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
       buf += dec.decode(value, { stream: true });
       const lines = buf.split("\n"); buf = lines.pop();
-      lines.forEach(handle);
+      lines.forEach(l => onStreamLine(s, l));
     }
-    handle(buf);
-    await whenIdle();
-  } catch (e) {
-    if (e.name !== "AbortError") setStatus("Error: " + e.message);
-  } finally {
-    if (chatCtrl === ctrl) chatCtrl = null;
-    if (!ctrl.signal.aborted) setStatus(idleStatus());
+    onStreamLine(s, buf);
+  })();
+  return s;
+}
+function onStreamLine(s, line) {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (s.firstAt == null) {
+    s.firstAt = performance.now();
+    if (s.speculative) dbg(`early reply: first sentence ready after ${((s.firstAt - s.t0) / 1000).toFixed(2)}s (held, not played)`, "bc");
   }
+  if (s.committed) deliver(s, msg); else s.held.push(msg);  // speculative: wait until your turn really ends
+}
+function deliver(s, { text, audio, id }) {
+  if (!s.got) { s.got = true; unanswered.splice(0, s.texts.length); }  // answered (at least partly)
+  if (!s.bubble) { addMsg("bot", ""); s.bubble = $("log").lastChild; }
+  s.bubble.textContent += text; $("log").scrollTop = $("log").scrollHeight;
+  enqueue(URL.createObjectURL(new Blob([Uint8Array.from(atob(audio), c => c.charCodeAt(0))], { type: "audio/wav" })), id);
+  setStatus("Speaking…");
+}
+function commitStream(s) {  // your turn ended: release what is already ready, the rest plays as it arrives
+  s.committed = true; s.texts = unanswered.slice();
+  fetch(`/api/spec/commit?id=${s.id}`, { method: "POST" }).catch(() => {});
+  const n = s.held.length;
+  s.held.splice(0).forEach(m => deliver(s, m));
+  return n;
+}
+
+async function chatTurn() {
+  const text = unanswered.join("");
+  let s;
+  if (spec && spec.stream && !spec.stream.ctrl.signal.aborted && spec.stream.text === text) {
+    s = spec.stream; spec = null;
+    const saved = s.firstAt ? s.firstAt - s.t0 : performance.now() - s.t0;
+    const n = commitStream(s);
+    dbg(`turn ended → early reply used (${n} sentence(s) ready, saved ≈ ${(saved / 1000).toFixed(2)}s)`, "bc");
+  } else {
+    cancelSpec();
+    s = startStream(text, false);
+  }
+  chatCtrl = s.ctrl;
+  setStatus(s.got ? "Speaking…" : "Thinking…");
+  let failed = false;
+  try {
+    await s.promise;
+    await whenIdle();
+    if (!s.got && !s.ctrl.signal.aborted) {  // the stream ended without a single sentence: tell the user, don't stay silent
+      failed = true; dbg("reply stream ended with no sentences", "warn"); setStatus("Error: no reply was produced (see Debug → Saved log)");
+    }
+  } catch (e) {
+    if (e.name !== "AbortError") { failed = true; dbg("reply stream failed: " + e.message, "warn"); setStatus("Error: " + e.message); }
+  } finally {
+    if (chatCtrl === s.ctrl) chatCtrl = null;
+    if (failed) setTimeout(() => { if ($("status").textContent.startsWith("Error")) setStatus(idleStatus()); }, 10000);  // keep the error visible
+    else if (!s.ctrl.signal.aborted) setStatus(idleStatus());
+  }
+}
+
+// You paused: transcribe what you said so far (not logged) and start the reply early, held until the turn ends.
+async function startSpec(frames, sr) {
+  const token = ++specSeq;
+  spec = { token, stream: null, specText: null };
+  dbg(`pause ≥ ${SPEC_AT}s → starting the reply early`, "bc");
+  let text;
+  try {
+    const fd = new FormData(); fd.append("audio", encodeWav(frames, sr), "spec.wav"); fd.append("kind", "user"); fd.append("log", "0");
+    ({ text } = await (await api("/api/asr", { method: "POST", body: fd })).json());
+  } catch (e) { if (token === specSeq) spec = null; return; }
+  if (token !== specSeq) return;                      // you spoke again, or the turn ended, meanwhile
+  if (!text || asrPending > 0) { spec = null; return; }
+  spec.specText = text;
+  spec.stream = startStream(unanswered.join("") + text, true);
+  spec.stream.promise.catch(() => {});                // aborts are expected
+  dbg(`early reply: ${JSON.stringify(text)} → LLM running`, "bc");
+}
+function cancelSpec() {
+  specSeq++;
+  if (spec && spec.stream) {
+    const id = spec.stream.id;
+    spec.stream.ctrl.abort();
+    fetch("/api/interrupt", { method: "POST" }).catch(() => {});
+    fetch(`/api/spec/cancel?id=${id}`, { method: "POST" }).catch(() => {});
+    dbg("you kept talking → early reply discarded", "warn");
+  }
+  spec = null;
 }
 
 // A finished utterance from the mic. Transcription runs strictly in order so text is never reordered or lost;
 // the bot answers once everything you said is transcribed and you've stopped talking.
-function handleUtterance(wav, backchannel = false, offset = null) {
+function handleUtterance(wav, backchannel = false, offset = null, knownText = null) {
   asrPending++;
-  asrQueue = asrQueue.then(() => transcribe(wav, backchannel, offset)).finally(() => { asrPending--; maybeAnswer(); });
+  asrQueue = asrQueue.then(() => transcribe(wav, backchannel, offset, knownText)).finally(() => { asrPending--; maybeAnswer(); });
 }
 
-async function transcribe(wav, backchannel, offset) {
+async function transcribe(wav, backchannel, offset, knownText) {
   if (!backchannel) setStatus("Transcribing…");
   try {
     const fd = new FormData(); fd.append("audio", wav, "utt.wav"); fd.append("kind", backchannel ? "backchannel" : "user");
     if (offset != null) fd.append("offset", offset);
+    if (knownText != null) fd.append("known_text", knownText);  // already transcribed while you paused: skip the model
     const { text } = await (await api("/api/asr", { method: "POST", body: fd })).json();
     dbg(`ASR (${backchannel ? "backchannel" : "user"}): ${text ? JSON.stringify(text) : "empty — not logged"}`, backchannel ? "bc" : "");
     if (text && backchannel) addMsg("backchannel", text);   // shown only; doesn't trigger a reply
@@ -322,13 +424,23 @@ $("send").onclick = () => {
   fetch("/api/typed", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ text: t }) }).catch(() => {});
 };
 $("text").onkeydown = e => { if (e.key === "Enter" && !e.isComposing) $("send").click(); };
+$("pause").value = PAUSE_MS; $("pausev").textContent = PAUSE_MS;
+$("pause").oninput = () => {
+  PAUSE_MS = +$("pause").value; $("pausev").textContent = PAUSE_MS;
+  try { localStorage.setItem("pause_ms", PAUSE_MS); } catch (e) {}
+};
 $("th").oninput = () => $("thv").textContent = (+$("th").value).toFixed(3);
 
 // ---------- always-on mic with simple energy VAD ----------
-let END_AFTER = 1.0;  // silence that ends your turn (was 0.8)
+let END_AFTER = 1.5;  // silence that ends your turn. Long is fine now: the reply is already being prepared (see SPEC_AT)
 const PRE_ROLL = 0.3, START_AFTER = 0.2, MIN_SPEECH = 0.3, MAX_UTT = 30;
 // Filler backchannel: when you pause this long mid-turn (but haven't finished), the AI says a fixed "うん" (no LLM).
-let FILLER_ON = true, FILLER_AT = 0.8;
+// Speculative reply: after SPEC_AT of silence the LLM starts on what you said so far, but the reply is only held.
+// If you speak again it is thrown away; if the silence reaches END_AFTER it is released with little waiting.
+let SPEC_ON = true, SPEC_AT = 0.6;
+const SPEC_MIN_SPEECH = 0.6, SPEC_COOLDOWN = 1500;
+let lastSpec = 0, specSeq = 0, spec = null;  // spec = { token, stream, specText } while a speculative reply exists
+let FILLER_ON = false, FILLER_AT = 0.8;
 const FILLERS = ["うん。", "うんうん。", "うん、うん。"], FILLER_MIN_SPEECH = 0.6, FILLER_COOLDOWN = 4000;
 let lastFiller = 0, epoch = 0;
 let BARGE_AFTER = 1.0;  // while the bot is talking, only speech longer than this interrupts it; shorter = backchannel
@@ -375,7 +487,7 @@ function onFrame(f) {
     if (vad.loud >= START_AFTER) {
       vad.state = "speech"; vad.utt = vad.pre.slice(); vad.uttT = vad.preT; vad.quiet = 0;
       vad.pre = []; vad.preT = 0;
-      vad.fillerSent = false;
+      vad.fillerSent = false; vad.specSent = false;
       vad.startSample = rec.total - vad.utt.reduce((a, x) => a + x.length, 0);  // where this utterance starts in the full recording
       vad.overBot = !!chatCtrl;              // bot is generating / speaking: don't interrupt yet
       dbg(`speech start — bot ${vad.overBot ? "BUSY → holding (possible backchannel)" : "idle → normal turn"}`);
@@ -386,8 +498,12 @@ function onFrame(f) {
   vad.utt.push(f); vad.uttT += dur;
   // While our own filler plays, a bit of it can leak into the mic: only clearly louder sound counts as you speaking.
   const heard = rms > (cur && cur.filler ? th * 3 : th);
-  if (heard) vad.fillerSent = false;
+  if (heard) { vad.fillerSent = false; if (vad.specSent) { vad.specSent = false; cancelSpec(); } }  // spoke again: drop the early reply
   vad.quiet = heard ? 0 : vad.quiet + dur;
+  if (SPEC_ON && !vad.overBot && !vad.specSent && vad.quiet >= SPEC_AT && vad.quiet < END_AFTER
+      && vad.uttT - vad.quiet >= SPEC_MIN_SPEECH && asrPending === 0 && Date.now() - lastSpec > SPEC_COOLDOWN) {
+    vad.specSent = true; lastSpec = Date.now(); startSpec(vad.utt.slice(), micCtx.sampleRate);
+  }
   if (FILLER_ON && !vad.overBot && !vad.fillerSent && vad.quiet >= FILLER_AT && vad.quiet < END_AFTER
       && vad.uttT - vad.quiet >= FILLER_MIN_SPEECH && Date.now() - lastFiller > FILLER_COOLDOWN) {
     vad.fillerSent = true; lastFiller = Date.now(); fillerBackchannel();
@@ -402,9 +518,12 @@ function onFrame(f) {
     const backchannel = vad.overBot && !!chatCtrl;
     dbg(`speech end — ${speech.toFixed(2)}s → ` + (backchannel ? "BACKCHANNEL" : speech >= MIN_SPEECH
       ? (vad.overBot ? "normal turn (bot finished meanwhile)" : "normal turn") : `discarded (noise, < ${MIN_SPEECH}s)`), backchannel ? "bc" : "");
-    Object.assign(vad, { state: "idle", utt: [], uttT: 0, loud: 0, quiet: 0, overBot: false, fillerSent: false });
+    Object.assign(vad, { state: "idle", utt: [], uttT: 0, loud: 0, quiet: 0, overBot: false, fillerSent: false, specSent: false });
+    // An early reply for exactly this speech can be reused (its transcript too); one still transcribing is dropped.
+    const specText = spec && spec.stream ? spec.specText : null;
+    if (spec && !spec.stream) { specSeq++; spec = null; }
     if (backchannel) handleUtterance(encodeWav(frames, sr), true, offset);
-    else if (speech >= MIN_SPEECH) handleUtterance(encodeWav(frames, sr), false, offset);
+    else if (speech >= MIN_SPEECH) handleUtterance(encodeWav(frames, sr), false, offset, specText);
     else maybeAnswer();  // too short: noise
   }
 }
@@ -451,8 +570,8 @@ function stopListening() {
 $("mic").onclick = async () => {
   unlockAudio();
   try {
-    if (listening) { bargeIn(); listening = false; stopListening(); $("mic").textContent = "🎙 Start conversation"; $("mic").className = "primary"; setStatus(""); }
-    else { await startListening(); listening = true; $("mic").textContent = "⏹ Stop conversation"; $("mic").className = "rec"; setStatus("Listening…"); }
+    if (listening) { bargeIn(); listening = false; $("llm").disabled = false; $("llm-note").textContent = ""; stopListening(); $("mic").textContent = "🎙 Start conversation"; $("mic").className = "primary"; setStatus(""); }
+    else { await startListening(); listening = true; $("llm").disabled = true; $("llm-note").textContent = "(locked during conversation)"; $("mic").textContent = "⏹ Stop conversation"; $("mic").className = "rec"; setStatus("Listening…"); }
   } catch (e) { setStatus("Mic error: " + e.message); }
 };
 
@@ -480,6 +599,29 @@ async function setTestMode(on) {
   lastRows = ""; refreshDebug();
 }
 $("dbg-test").onchange = () => setTestMode($("dbg-test").checked).catch(e => setStatus("Error: " + e.message));
+$("bench-run").onclick = async () => {
+  if (listening) { $("bench-status").textContent = "Stop the conversation first."; return; }
+  $("bench-run").disabled = true; $("bench-status").textContent = "running… (about a minute)"; $("bench-out").innerHTML = "";
+  try {
+    const d = await (await api("/api/debug/llm_bench?reps=" + (+$("bench-reps").value || 3), { method: "POST" })).json();
+    const f = v => v == null ? "–" : v.toFixed(2) + " s", esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+    const ok = d.results.filter(r => r.ok && r.median && r.median.sentence != null);
+    const best = Math.min(...ok.map(r => r.median.sentence));
+    let html = `<table class="tbl"><tr><th align="left">LLM</th><th>first token</th><th>first sentence</th><th>whole reply</th><th>avg chars</th>` +
+               d.prompts.map(p => `<th>${esc(p)}<br><small>first sentence</small></th>`).join("") + `<th>worst first sentence</th></tr>`;
+    for (const r of d.results) {
+      if (!r.ok) { html += `<tr><td>${esc(r.label)}</td><td colspan="${5 + d.prompts.length}" style="color:var(--muted)">unavailable</td></tr>`; continue; }
+      const m = r.median, win = ok.length > 1 && m.sentence === best;
+      html += `<tr style="${win ? "font-weight:700" : ""}"><td>${esc(r.label)}${win ? " ✓ fastest" : ""}</td><td align="right">${f(m.first)}</td><td align="right">${f(m.sentence)}</td>` +
+              `<td align="right">${f(m.total)}</td><td align="right">${m.chars == null ? "–" : m.chars}</td>` +
+              r.by_prompt.map(b => `<td align="right">${f(b.sentence)}</td>`).join("") + `<td align="right">${f(r.worst_sentence)}</td></tr>` +
+              (r.errors.length ? `<tr><td colspan="${6 + d.prompts.length}" style="color:var(--rec);font-size:12px">${r.errors.length} error(s): ${esc(r.errors[0])}</td></tr>` : "");
+    }
+    $("bench-out").innerHTML = html + "</table>" + `<div style="color:var(--muted);font-size:12px;margin-top:6px">Medians over ${d.reps} run(s) × ${d.prompts.length} prompts (after one warm-up call each).</div>`;
+    $("bench-status").textContent = "done";
+  } catch (e) { $("bench-status").textContent = "failed: " + e.message; }
+  finally { $("bench-run").disabled = false; }
+};
 $("dbg-speak").onclick = async () => {
   unlockAudio(); await setTestMode(true);
   if (!listening) setStatus("Tip: press Start conversation first, so your backchannel can be recorded.");
@@ -488,6 +630,8 @@ $("dbg-speak").onclick = async () => {
 $("dbg-clear").onclick = () => { dbgLines.length = 0; $("dbglog").innerHTML = ""; };
 $("dbg-barge").onchange = () => BARGE_AFTER = +$("dbg-barge").value;
 $("dbg-end").onchange = () => END_AFTER = +$("dbg-end").value;
+$("dbg-spec-at").onchange = () => SPEC_AT = +$("dbg-spec-at").value;
+$("dbg-spec-on").onchange = () => SPEC_ON = $("dbg-spec-on").checked;
 $("dbg-filler-at").onchange = () => FILLER_AT = +$("dbg-filler-at").value;
 $("dbg-filler-on").onchange = () => FILLER_ON = $("dbg-filler-on").checked;
 
@@ -504,7 +648,7 @@ function renderLive() {
     kv("mic", listening ? "on" : "off"), kv("VAD state", vad.state), kv("mic level", $("lvl").value.toFixed(3) + " / th " + $("th").value),
     kv("speaking over bot", vad.overBot), kv("bot busy (generating/playing)", !!chatCtrl), kv("audio playing", playing),
     kv("queued clips", queue.length), kv("ASR pending", asrPending), kv("unanswered texts", unanswered.length),
-    kv("full recording (s)", listening ? (rec.total / rec.sr).toFixed(1) : "–"), kv("current speech (s)", vad.state === "speech" ? (vad.uttT - vad.quiet).toFixed(2) : "–"),
+    kv("early reply", spec ? (spec.stream ? (spec.stream.firstAt ? "ready, held" : "LLM running") : "transcribing") : "–"), kv("full recording (s)", listening ? (rec.total / rec.sr).toFixed(1) : "–"), kv("current speech (s)", vad.state === "speech" ? (vad.uttT - vad.quiet).toFixed(2) : "–"),
   ].join("");
 }
 let lastRows = "";
@@ -535,6 +679,14 @@ $("reset").onclick = async () => {
 };
 
 api("/api/session?kind=normal", { method: "POST" }).catch(() => {});  // page load = normal mode (checkbox is unticked)
+async function loadLlms() {
+  const { default: def, llms } = await (await api("/api/llms")).json();
+  $("llm").innerHTML = llms.map(l => `<option value="${l.id}" ${l.ok ? "" : "disabled"}>${l.label}${l.ok ? "" : " — unavailable"}</option>`).join("");
+  const saved = localStorage.getItem("llm");
+  $("llm").value = llms.some(l => l.id === saved && l.ok) ? saved : def;
+}
+$("llm").onchange = () => { localStorage.setItem("llm", $("llm").value); dbg("LLM set to " + $("llm").value); };
+loadLlms().catch(e => setStatus("Could not load LLM list: " + e.message));
 loadModels().catch(e => setStatus("Could not load models: " + e.message));
 </script>
 </body>

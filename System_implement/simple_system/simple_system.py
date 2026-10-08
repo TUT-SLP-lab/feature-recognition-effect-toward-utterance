@@ -2,10 +2,13 @@
 Simple cascaded voice chat: mic -> Kotoba-Whisper (ASR) -> Gemini 3.5 Flash Lite (LLM) -> Style-Bert-VITS2 (TTS).
 
 Run:  GENAI_API_KEY=... python simple_system.py   (then open http://localhost:8000)
+LLMs: Gemini 3.5 Flash-Lite (needs GENAI_API_KEY) and local Gemma 4 12B (QAT 4-bit, served by llama.cpp); pick one in the web UI
+      before starting the conversation. A model that can't load is simply greyed out.
 Uses the same dependencies as ../Voice_Chat_App/requirements.txt.
 """
 
 import asyncio
+import atexit
 import base64
 import io
 import json
@@ -14,6 +17,8 @@ import queue
 import random
 import struct
 import subprocess
+import traceback
+import urllib.request
 import sys
 import re
 import threading
@@ -44,7 +49,15 @@ from style_bert_vits2.tts_model import TTSModel  # noqa: E402
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 ASR_MODEL = "kotoba-tech/kotoba-whisper-v2.0"
-LLM_MODEL = "gemini-3.5-flash-lite"
+GEMINI_MODEL = "gemini-3.5-flash-lite"
+GEMMA_MODEL = "google/gemma-4-12B-it-qat-q4_0-gguf"  # official quantization-aware-trained 4-bit GGUF (llama.cpp)
+GEMMA_FILE = "gemma-4-12b-it-qat-q4_0.gguf"
+GEMMA_MAX_NEW_TOKENS = 120  # replies are meant to be 1-2 short sentences
+GEMMA_HISTORY_MESSAGES = 24  # only the most recent messages go to the local model (its context is limited)
+# llama.cpp's server is started by this script (build it once: see ~/llama.cpp). Override with env vars if needed.
+LLAMA_SERVER = os.environ.get("LLAMA_SERVER", str(Path.home() / "llama.cpp/build/bin/llama-server"))
+LLAMA_PORT = int(os.environ.get("LLAMA_PORT", 8081))
+LLAMA_CTX = 8192
 BERT_ID = "ku-nlp/deberta-v2-large-japanese-char-wwm"
 HERE = Path(__file__).resolve().parent
 MODEL_ASSETS = SBV2_DIR / "model_assets"
@@ -98,15 +111,118 @@ def get_tts(model_id: str) -> TTSModel:
     return _tts_cache[model_id]
 
 
-client = genai.Client(api_key=os.environ["GENAI_API_KEY"])
+# ---------------- LLM backends ----------------
+# Conversation = list of (role, text) with role "user" | "assistant"; each backend converts it to its own format.
+history: list[tuple[str, str]] = []  # single-user demo: one conversation
 
 
-LLM_CONFIG = types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
-history: list[types.Content] = []  # single-user demo: one conversation
+def turn(role: str, text: str) -> tuple[str, str]:
+    return (role, text)
 
 
-def turn(role: str, text: str) -> types.Content:
-    return types.Content(role=role, parts=[types.Part(text=text)])
+# Both are loaded at startup; the web UI picks one per conversation. A failed load only greys that choice out.
+LLMS = {
+    "gemini": {"label": "Gemini 3.5 Flash-Lite (cloud)", "model": GEMINI_MODEL, "ok": False},
+    "gemma": {"label": "Gemma 4 12B, QAT 4-bit (local, llama.cpp)", "model": GEMMA_MODEL, "ok": False},
+}
+DEFAULT_LLM = "gemini"
+active_llm = DEFAULT_LLM  # the one most recently used; recorded in the chat log
+
+try:
+    client = genai.Client(api_key=os.environ["GENAI_API_KEY"])
+    LLM_CONFIG = types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
+    LLMS["gemini"]["ok"] = True
+except Exception as e:
+    print(f"[llm] Gemini unavailable: {e!r} (set GENAI_API_KEY)", flush=True)
+
+llama_proc = None
+
+
+def start_llama_server():
+    """Start llama.cpp's server with Gemma and wait until it is ready. Its log goes to llama_server.log."""
+    global llama_proc
+    from huggingface_hub import hf_hub_download
+    if not Path(LLAMA_SERVER).exists():
+        raise FileNotFoundError(f"{LLAMA_SERVER} not found (build llama.cpp, or set LLAMA_SERVER)")
+    gguf = hf_hub_download(GEMMA_MODEL, GEMMA_FILE)
+    cmd = [LLAMA_SERVER, "-m", gguf, "-ngl", "99", "-c", str(LLAMA_CTX), "-np", "1", "--host", "127.0.0.1",
+           "--port", str(LLAMA_PORT), "--jinja", "-fa", "on", "--chat-template-kwargs", '{"enable_thinking":false}']
+    llama_proc = subprocess.Popen(cmd, stdout=open(HERE / "llama_server.log", "w"), stderr=subprocess.STDOUT)
+    atexit.register(stop_llama_server)
+    for _ in range(240):  # up to 2 minutes
+        if llama_proc.poll() is not None:
+            raise RuntimeError(f"llama-server exited with code {llama_proc.returncode} (see llama_server.log)")
+        try:
+            if urllib.request.urlopen(f"http://127.0.0.1:{LLAMA_PORT}/health", timeout=1).status == 200:
+                return
+        except Exception:
+            time.sleep(0.5)
+    raise TimeoutError("llama-server did not become ready (see llama_server.log)")
+
+
+def stop_llama_server():
+    if llama_proc and llama_proc.poll() is None:
+        llama_proc.terminate()
+        try:
+            llama_proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            llama_proc.kill()
+
+
+try:
+    start_llama_server()
+    LLMS["gemma"]["ok"] = True
+except Exception as e:
+    print(f"[llm] Gemma unavailable: {e!r}", flush=True)
+if not LLMS[DEFAULT_LLM]["ok"]:
+    DEFAULT_LLM = active_llm = next((k for k, v in LLMS.items() if v["ok"]), DEFAULT_LLM)
+
+
+def _gemini_stream(messages, cancelled):
+    contents = [types.Content(role="model" if r == "assistant" else r, parts=[types.Part(text=t)]) for r, t in messages]
+    for chunk in client.models.generate_content_stream(model=GEMINI_MODEL, contents=contents, config=LLM_CONFIG):
+        if cancelled():
+            return
+        if chunk.text:
+            yield chunk.text
+
+
+def _gemma_stream(messages, cancelled):
+    """Stream from the llama.cpp server. Dropping the connection makes the server stop generating at once."""
+    chat = [{"role": "system", "content": SYSTEM_PROMPT}] + [{"role": r, "content": t} for r, t in messages[-GEMMA_HISTORY_MESSAGES:]]
+    body = {"model": "gemma", "messages": chat, "stream": True, "max_tokens": GEMMA_MAX_NEW_TOKENS,
+            "temperature": 1.0, "top_k": 64, "top_p": 0.95,   # Google's recommended sampling for Gemma 4
+            "cache_prompt": True,                              # reuse the shared start of the conversation between turns
+            "chat_template_kwargs": {"enable_thinking": False}}  # answer right away, no reasoning delay
+    req = urllib.request.Request(f"http://127.0.0.1:{LLAMA_PORT}/v1/chat/completions", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    resp = urllib.request.urlopen(req, timeout=60)
+    try:
+        for raw in resp:  # server-sent events: b"data: {...}\n"
+            if cancelled():
+                return
+            line = raw.decode("utf-8").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                return
+            choices = json.loads(data).get("choices") or [{}]
+            piece = choices[0].get("delta", {}).get("content")
+            if piece:
+                yield piece
+    finally:
+        resp.close()
+
+
+def llm_stream(messages, cancelled=lambda: False, llm=None):
+    """Yield the reply text piece by piece from the chosen LLM ("gemini" | "gemma")."""
+    global active_llm
+    llm = llm or DEFAULT_LLM
+    if llm not in LLMS or not LLMS[llm]["ok"]:
+        raise RuntimeError(f"LLM {llm!r} is not available")
+    active_llm = llm
+    yield from (_gemini_stream if llm == "gemini" else _gemma_stream)(messages, cancelled)
 
 
 # Full duplex: a newer request (or /api/interrupt) bumps `turn_no`, which makes the running reply stop.
@@ -152,20 +268,29 @@ def new_session(kind: str | None = None):
         mic_rec.update(rel=None, path=None, sr=0, samples=0, ai_rel=None, ai_path=None)  # next mic chunk starts a new recording
 
 
-def log_audio(role: str, wav: bytes) -> str:
-    """Queue a WAV for saving; returns its path relative to the session folder."""
+def log_audio(role: str, wav: bytes, hold: list | None = None) -> str:
+    """Queue a WAV for saving; returns its path relative to the session folder.
+    With `hold`, the write is parked in that list instead (speculative replies; see /api/spec/commit)."""
     with log_lock:
         session["n"][role] += 1
         rel = f"audio/{role}/{session['n'][role]:04d}.wav"
-        log_q.put(("file", session["dir"] / rel, wav))
+        item = ("file", session["dir"] / rel, wav)
+        if hold is None:
+            log_q.put(item)
+        else:
+            hold.append(item)
     return rel
 
 
-def log_chat(role: str, text: str, audio: str | None = None, **extra):
+def log_chat(role: str, text: str, audio: str | None = None, hold: list | None = None, **extra):
     with log_lock:
-        entry = {"time": datetime.now().isoformat(timespec="milliseconds"), "mode": session["kind"],
+        entry = {"time": datetime.now().isoformat(timespec="milliseconds"), "mode": session["kind"], "llm": LLMS[active_llm]["model"],
                  "role": role, "text": text, "audio": audio, **extra}
-        log_q.put(("chat", session["dir"], entry))
+        item = ("chat", session["dir"], entry)
+        if hold is None:
+            log_q.put(item)
+        else:
+            hold.append(item)
 
 
 ai_track_sr: dict[Path, int] = {}  # AI track path -> sample rate (writer thread only)
@@ -278,14 +403,16 @@ def warmup():
             req = TTSRequest(text=text, model=model_id)
             _filler_cache[(req.model, req.style, req.style_weight, req.length, text)] = synth(req)
 
-    def llm_step():
-        for _ in client.models.generate_content_stream(model=LLM_MODEL, contents="こんにちは", config=LLM_CONFIG):
+    def llm_step(llm):
+        for _ in llm_stream([turn("user", "こんにちは")], llm=llm):
             pass
 
     step("ASR", asr_step)
     step("TTS", tts_step)
     step("fillers", filler_step)
-    step("LLM", llm_step)
+    for name, info in LLMS.items():
+        if info["ok"]:
+            step(f"LLM {name}", lambda name=name: llm_step(name))
 
 
 @asynccontextmanager
@@ -295,6 +422,7 @@ async def lifespan(_app):
     with log_lock:
         finalize_recording_locked()
     log_q.put(None)  # flush pending log writes
+    stop_llama_server()
     log_thread.join(timeout=10)
 
 
@@ -322,6 +450,11 @@ class TTSRequest(BaseModel):
     style: str = "Neutral"
     style_weight: float = 5.0
     length: float = 1.0  # >1.0 slower
+
+
+@app.get("/api/llms")
+def api_llms():
+    return {"default": DEFAULT_LLM, "llms": [{"id": k, "label": v["label"], "ok": v["ok"]} for k, v in LLMS.items()]}
 
 
 @app.get("/api/models")
@@ -383,17 +516,23 @@ def api_play_event(ev: PlayEvent):
 
 
 @app.post("/api/asr")
-def api_asr(audio: UploadFile = File(...), kind: str = Form("user"), offset: float | None = Form(None)):
+def api_asr(audio: UploadFile = File(...), kind: str = Form("user"), offset: float | None = Form(None),
+            log: int = Form(1), known_text: str | None = Form(None)):
     # kind: "user" | "backchannel"; offset: where this utterance starts in the continuous mic recording (seconds)
+    # log=0: speculative transcription, don't record it; known_text: already transcribed speculatively, skip the model
     t0 = time.perf_counter()
     raw = audio.file.read()
     samples = decode_audio(raw)
     if len(samples) < 1600:  # < 0.1 s
         return {"text": ""}
-    result = asr({"raw": samples, "sampling_rate": 16000}, generate_kwargs={"language": "ja", "task": "transcribe"})
-    text = result["text"].strip()
-    log_time("ASR", t0, f"(audio {len(samples) / 16000:.1f}s) -> {text!r}")
-    if text:
+    if known_text is not None:
+        text = known_text.strip()
+    else:
+        result = asr({"raw": samples, "sampling_rate": 16000}, generate_kwargs={"language": "ja", "task": "transcribe"})
+        text = result["text"].strip()
+    log_time("ASR", t0, f"(audio {len(samples) / 16000:.1f}s{', reused speculative text' if known_text is not None else ''}"
+                        f"{'' if log else ', speculative'}) -> {text!r}")
+    if text and log:
         with log_lock:
             full = mic_rec["rel"]
         log_chat(kind if kind in ("user", "backchannel") else "user", text, log_audio("human", raw),
@@ -451,14 +590,29 @@ def api_chat(req: ChatRequest):
         raise HTTPException(400, "Empty text")
     t0 = time.perf_counter()
     user = turn("user", req.text.strip())
-    reply = client.models.generate_content(model=LLM_MODEL, contents=history + [user], config=LLM_CONFIG).text.strip()
-    history.extend([user, turn("model", reply)])
+    reply = "".join(llm_stream(history + [user])).strip()
+    history.extend([user, turn("assistant", reply)])
     log_time("LLM", t0, f"-> {reply!r}")
     return {"reply": reply}
 
 
+def trim_silence(wav: np.ndarray, sr: int, thr: float = 0.01, lead_ms: int = 30, tail_ms: int = 100) -> np.ndarray:
+    """Cut the synthesizer's built-in padding (about 0.4 s of faint noise before and after every sentence).
+    Measured on real clips: only the padding is removed (at most 0.01% of a clip's energy), so the gap between
+    sentences is then set by the page's "Pause between sentences" instead of ~0.9 s of baked-in silence."""
+    w = max(1, int(0.01 * sr))
+    mag = np.abs(wav.astype(np.float32))
+    if np.issubdtype(wav.dtype, np.integer):  # the voice model returns 16-bit integers: measure on a -1..1 scale
+        mag /= np.iinfo(wav.dtype).max
+    level = np.convolve(mag, np.ones(w) / w, mode="same")  # 10 ms average level
+    loud = np.where(level > thr)[0]
+    if not len(loud):
+        return wav
+    return wav[max(0, loud[0] - lead_ms * sr // 1000): min(len(wav), loud[-1] + 1 + tail_ms * sr // 1000)]
+
+
 def synth(req: TTSRequest) -> bytes:
-    """Text -> WAV bytes."""
+    """Text -> WAV bytes (silence at both ends trimmed)."""
     model = get_tts(req.model)
     style = req.style if req.style in model.style2id else next(iter(model.style2id))
     # SBV2's g2p crashes on "!" before more text ("Input must be katakana only: ！"), so use "。" instead.
@@ -467,7 +621,7 @@ def synth(req: TTSRequest) -> bytes:
         text=text, language=Languages.JP, style=style, style_weight=req.style_weight, length=req.length,
     )
     buf = io.BytesIO()
-    sf.write(buf, wav, sr, format="WAV")
+    sf.write(buf, trim_silence(wav, sr), sr, format="WAV")
     return buf.getvalue()
 
 
@@ -499,12 +653,83 @@ def api_tts(req: TTSRequest):
 
 
 SENTENCE_END = re.compile(r"[^。！？!?\n]*[。！？!?\n]+")
+
+
+# ---- LLM latency benchmark (Debug tab) ----
+# Same prompts for every LLM, run one after another. "first sentence" = when the first complete sentence is available,
+# which is what actually gates TTS. Run it while idle: it shares the GPU with everything else.
+BENCH_PROMPTS = [
+    [("user", "こんにちは")],
+    [("user", "一度行ってみたい旅行先ってありますか？"), ("assistant", "私は海が見えるカフェのある地中海沿岸に行ってみたいな。"),
+     ("user", "僕は北海道に行ってみたいんですよね。")],
+    [("user", "こんにちは"), ("assistant", "やっほー、今日は何の話をしようか？"), ("user", "旅行の話がしたいです。"),
+     ("assistant", "いいね！行ってみたい国とかある？"), ("user", "ヨーロッパかな。"),
+     ("assistant", "ヨーロッパいいよね。私は街並みをのんびり歩きたいなあ。"),
+     ("user", "なんかどこのふりのかは忘れたんですけどコピコっていうキャンディーそのキャンディーがなんかコーヒー味のキャンディで"
+              "作業する時によく食べます。まあ、苦すぎなくて、少し甘いの方がいいんです。")],
+]
+bench_lock = threading.Lock()
+
+
+@app.post("/api/debug/llm_bench")
+def api_llm_bench(reps: int = 3):
+    reps = max(1, min(reps, 10))
+    if not bench_lock.acquire(blocking=False):
+        raise HTTPException(409, "a benchmark is already running")
+    try:
+        out = []
+        for name, info in LLMS.items():
+            entry = {"id": name, "label": info["label"], "ok": info["ok"], "runs": [], "errors": []}
+            out.append(entry)
+            if not info["ok"]:
+                continue
+            try:
+                list(llm_stream([("user", "こんにちは")], llm=name))  # warm-up, not counted
+            except Exception as e:
+                entry["errors"].append(f"warm-up: {e!r}")
+            for _ in range(reps):
+                for pi, msgs in enumerate(BENCH_PROMPTS):
+                    nonce = len(entry["runs"]) + 1  # new text at the end each run, like a real new message (prefix may be cached)
+                    msgs = msgs[:-1] + [(msgs[-1][0], msgs[-1][1] + "　" * nonce)]
+                    t0, first, sent, buf = time.perf_counter(), None, None, ""
+                    try:
+                        for piece in llm_stream(msgs, llm=name):
+                            now = time.perf_counter() - t0
+                            first = now if first is None else first
+                            buf += piece
+                            if sent is None and SENTENCE_END.match(buf):
+                                sent = now
+                    except Exception as e:
+                        entry["errors"].append(f"prompt {pi}: {e!r}")
+                        continue
+                    total = time.perf_counter() - t0
+                    entry["runs"].append({"prompt": pi, "first": first, "sentence": total if sent is None else sent,
+                                          "total": total, "chars": len(buf)})
+
+            def med(key, rows):
+                v = sorted(r[key] for r in rows if r[key] is not None)
+                return v[len(v) // 2] if v else None
+            entry["median"] = {k: med(k, entry["runs"]) for k in ("first", "sentence", "total", "chars")}
+            entry["by_prompt"] = [{k: med(k, [r for r in entry["runs"] if r["prompt"] == pi]) for k in ("first", "sentence", "total")}
+                                  for pi in range(len(BENCH_PROMPTS))]
+            entry["worst_sentence"] = max((r["sentence"] for r in entry["runs"]), default=None)
+        return {"reps": reps, "prompts": ["short greeting", "3-turn chat", "long 25 s utterance (6-turn history)"], "results": out}
+    finally:
+        bench_lock.release()
 SPEAKABLE = re.compile(r"[^\W_]")  # at least one letter/kana/kanji/digit
 
 
 class StreamRequest(TTSRequest):
+    speculative: bool = False  # reply generated while you pause: nothing is logged/kept unless /api/spec/commit follows
+    spec_id: str = ""
+    llm: str = ""  # "gemini" | "gemma" (empty = default)
     test: bool = False  # debug: speak random canned sentences instead of calling the LLM
     # `text` is the user's message; the rest are TTS options
+
+
+# Spoken when a reply fails completely (LLM error / empty answer), instead of leaving you in silence.
+FALLBACK_REPLY = "ごめん、うまく聞き取れなかった。もう一回言ってくれる？"
+LLM_ATTEMPTS = 3
 
 
 # Debug test mode: long enough (several sentences, ~15 s) to leave room for backchannels while it talks.
@@ -518,6 +743,41 @@ TEST_REPLIES = [
     "最近、料理にはまっていて、毎日いろいろな味付けを試しているの。昨日は、トマトとバジルのスープを作ってみたよ。"
     "思ったより簡単で、お店の味みたいにできたんだ。今度は、カレーにも挑戦してみようかな。",
 ]
+
+
+# Speculative replies: id -> {"committed": bool, "hold": [parked log writes]}
+specs: dict[str, dict] = {}
+spec_lock = threading.Lock()
+
+
+@app.post("/api/spec/commit")
+def api_spec_commit(id: str):
+    """Your turn really ended: keep the speculative reply (write its parked log entries, log the rest as it comes)."""
+    with spec_lock:
+        st = specs.get(id)
+        if not st:
+            return {"ok": False}
+        st["committed"] = True
+        for item in st["hold"]:
+            log_q.put(item)
+        st["hold"].clear()
+        if st.get("finished"):  # it was already fully generated: finish what the generator would have done
+            specs.pop(id, None)
+            if st["spoken"]:
+                history.extend([st["user"], turn("assistant", "".join(st["spoken"]))])
+            log_chat("event", "speculative reply committed", turn=st["turn"])
+    return {"ok": True}
+
+
+@app.post("/api/spec/cancel")
+def api_spec_cancel(id: str):
+    """You kept talking: drop the speculative reply."""
+    with spec_lock:
+        st = specs.pop(id, None)
+    if st and st.get("finished"):  # (a still-running generator logs this itself when it notices the interrupt)
+        print(f"[speculative] discarded after {len(st['spoken'])} sentence(s)", flush=True)
+        log_chat("event", "speculative reply discarded (you kept talking)", sentences_ready=len(st["spoken"]), turn=st["turn"])
+    return {"ok": True}
 
 
 @app.post("/api/interrupt")
@@ -537,6 +797,9 @@ def api_chat_stream(req: StreamRequest):
     are kept in the history (and nothing is kept if none were sent)."""
     if not req.text.strip() and not req.test:
         raise HTTPException(400, "Empty text")
+    spec = None
+    if req.speculative:
+        spec = specs[req.spec_id] = {"committed": False, "hold": []}
 
     def events():
         global turn_no, turn_done
@@ -551,28 +814,68 @@ def api_chat_stream(req: StreamRequest):
         user = turn("user", req.text.strip())
         spoken, buf, first = [], "", True
 
-        def speak(sentence):
+        def problem(msg, **extra):  # failures are recorded in the chat log (not only the console) so they can be found later
+            print(f"[problem] {msg}", flush=True)
+            log_chat("event", msg, turn=my_turn, **extra)
+
+        def speak(sentence, fallback=False):
             sentence = sentence.strip()
             if not SPEAKABLE.search(sentence):
                 return None
             t1 = time.perf_counter()
-            audio = synth(req.model_copy(update={"text": sentence}))
+            try:
+                audio = synth(req.model_copy(update={"text": sentence}))
+            except Exception as e:  # one unspeakable sentence must not kill the whole reply
+                traceback.print_exc()
+                problem(f"TTS failed, sentence skipped: {e!r}", sentence=sentence)
+                return None
             log_time("TTS", t1, f"-> {sentence!r} (since start {time.perf_counter() - t0:.2f}s)")
-            spoken.append(sentence)
-            clip_id = log_audio("ai", audio)
-            log_chat("ai", sentence, clip_id, turn=my_turn)
+            if not fallback:
+                spoken.append(sentence)
+            with spec_lock:  # while speculative and not committed, logging is parked; commit flushes it
+                hold = spec["hold"] if spec and not spec["committed"] else None
+                clip_id = log_audio("ai", audio, hold=hold)
+                log_chat("ai", sentence, clip_id, hold=hold, turn=my_turn, **({"fallback": True} if fallback else {}))
             return json.dumps({"text": sentence, "audio": base64.b64encode(audio).decode(), "id": clip_id}) + "\n"
 
+        def llm_chunks():
+            """LLM text chunks. An error or empty answer before any text arrived is retried (it has been seen to
+            happen); after text has started, errors just end the reply."""
+            if req.test:
+                yield SimpleNamespace(text=random.choice(TEST_REPLIES))
+                return
+            for attempt in range(1, LLM_ATTEMPTS + 1):
+                got = False
+                try:
+                    stream = llm_stream(history + [user], cancelled, req.llm or None)
+                    try:
+                        for piece in stream:
+                            if cancelled():
+                                return
+                            got = True
+                            yield SimpleNamespace(text=piece)
+                    finally:
+                        stream.close()  # stops the model's generation thread right away (matters for the local model)
+                    if got:
+                        return
+                    reason = "empty answer"
+                except Exception as e:
+                    if got:
+                        traceback.print_exc()
+                        problem(f"LLM failed mid-reply: {e!r}")
+                        return
+                    traceback.print_exc()
+                    reason = f"error {e!r}"
+                problem(f"LLM {reason} (attempt {attempt}/{LLM_ATTEMPTS})", attempt=attempt)
+                if attempt < LLM_ATTEMPTS:
+                    time.sleep(0.5 * attempt)
+                    if cancelled():
+                        return
+
         try:
-            chunks = (
-                [SimpleNamespace(text=random.choice(TEST_REPLIES))] if req.test
-                else client.models.generate_content_stream(model=LLM_MODEL, contents=history + [user], config=LLM_CONFIG)
-            )
-            for chunk in chunks:
+            for chunk in llm_chunks():
                 if cancelled():
                     return
-                if not chunk.text:
-                    continue
                 if first:
                     log_time("LLM first chunk", t0)
                     first = False
@@ -585,13 +888,33 @@ def api_chat_stream(req: StreamRequest):
                         return
             if (line := speak(buf)) and not cancelled():
                 yield line
+            if not spoken and not cancelled():  # nothing at all could be said: don't leave you in silence
+                problem("no reply produced, speaking the fallback")
+                if (line := speak(FALLBACK_REPLY, fallback=True)) and not cancelled():
+                    yield line
             log_time("LLM+TTS total", t0)
         finally:
-            if cancelled():
-                print(f"[interrupted] after {len(spoken)} sentence(s)", flush=True)
-                log_chat("event", "interrupted", sentences_sent=len(spoken), turn=my_turn)
-            if spoken and not req.test:
-                history.extend([user, turn("model", "".join(spoken))])
+            with spec_lock:
+                # A speculative reply that finished before your turn ended just waits: commit/cancel decides its fate.
+                parked = bool(spec) and not spec["committed"] and not cancelled()
+                if parked:
+                    spec.update(finished=True, user=user, spoken=spoken, turn=my_turn)
+                elif spec:
+                    specs.pop(req.spec_id, None)
+                discarded = bool(spec) and not spec["committed"] and not parked
+            if parked:
+                pass
+            elif discarded:  # you kept talking: this reply never happened (nothing logged, history untouched)
+                print(f"[speculative] discarded after {len(spoken)} sentence(s)", flush=True)
+                log_chat("event", "speculative reply discarded (you kept talking)", sentences_ready=len(spoken), turn=my_turn)
+            else:
+                if spec:
+                    log_chat("event", "speculative reply committed", turn=my_turn)
+                if cancelled():
+                    print(f"[interrupted] after {len(spoken)} sentence(s)", flush=True)
+                    log_chat("event", "interrupted", sentences_sent=len(spoken), turn=my_turn)
+                if spoken and not req.test:
+                    history.extend([user, turn("assistant", "".join(spoken))])
             done.set()
 
     return StreamingResponse(events(), media_type="application/x-ndjson")
