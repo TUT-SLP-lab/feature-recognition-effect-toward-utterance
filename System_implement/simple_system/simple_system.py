@@ -1,5 +1,5 @@
 """
-Simple cascaded voice chat: mic -> Kotoba-Whisper (ASR) -> Gemini 3.5 Flash Lite (LLM) -> Style-Bert-VITS2 (TTS).
+Simple cascaded voice chat: mic -> Kotoba-Whisper (ASR) -> Gemini 3.5 Flash Lite/Genma 4 12B (LLM) -> Style-Bert-VITS2 (TTS).
 
 Run:  GENAI_API_KEY=... python simple_system.py   (then open http://localhost:8000)
 LLMs: Gemini 3.5 Flash-Lite (needs GENAI_API_KEY) and local Gemma 4 12B (QAT 4-bit, served by llama.cpp); pick one in the web UI
@@ -65,11 +65,12 @@ MODEL_ASSETS = SBV2_DIR / "model_assets"
 SYSTEM_PROMPT = """\
 あなたは「あおい」、25歳の女性です。
 相手は24歳の男性です。
-ユーザーと一度行ってみたい旅行先の話しをします。
+あなた相手と日常会話をしています。
+話題は一度行ってみたい旅行先です。
 返事は1〜2文の短い話し言葉で答えてください。
 質問以外、自分のことも話してください。
 時々今の話題に近い話題に切り替えてもいいです。
-相手が話し方言葉を繰り返さないようにしてください
+相手が話した言葉を繰り返さないようにしてください
 """
 
 # ---------------- load models once at startup ----------------
@@ -146,7 +147,8 @@ def start_llama_server():
         raise FileNotFoundError(f"{LLAMA_SERVER} not found (build llama.cpp, or set LLAMA_SERVER)")
     gguf = hf_hub_download(GEMMA_MODEL, GEMMA_FILE)
     cmd = [LLAMA_SERVER, "-m", gguf, "-ngl", "99", "-c", str(LLAMA_CTX), "-np", "1", "--host", "127.0.0.1",
-           "--port", str(LLAMA_PORT), "--jinja", "-fa", "on", "--chat-template-kwargs", '{"enable_thinking":false}']
+           "--port", str(LLAMA_PORT), "--jinja", "-fa", "on", "--chat-template-kwargs", '{"enable_thinking":false}',
+           "--swa-full"]  # Gemma's sliding-window layers can't reuse the cached conversation start without this (+2 GB, -0.3 s/turn)
     llama_proc = subprocess.Popen(cmd, stdout=open(HERE / "llama_server.log", "w"), stderr=subprocess.STDOUT)
     atexit.register(stop_llama_server)
     for _ in range(240):  # up to 2 minutes

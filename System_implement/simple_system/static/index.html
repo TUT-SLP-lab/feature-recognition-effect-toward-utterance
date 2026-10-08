@@ -130,7 +130,7 @@
         <input id="dbg-barge" type="number" min="0.3" max="5" step="0.1" value="1.0">
       </label>
       <label>End of speech silence (s)
-        <input id="dbg-end" type="number" min="0.3" max="3" step="0.1" value="1.5">
+        <input id="dbg-end" type="number" min="0.3" max="3" step="0.1" value="1.0">
       </label>
       <label>Start LLM early at silence (s)
         <input id="dbg-spec-at" type="number" min="0.3" max="3" step="0.1" value="0.6">
@@ -432,7 +432,7 @@ $("pause").oninput = () => {
 $("th").oninput = () => $("thv").textContent = (+$("th").value).toFixed(3);
 
 // ---------- always-on mic with simple energy VAD ----------
-let END_AFTER = 1.5;  // silence that ends your turn. Long is fine now: the reply is already being prepared (see SPEC_AT)
+let END_AFTER = 1.0;  // silence that ends your turn (the reply is prepared while you wait, see SPEC_AT)
 const PRE_ROLL = 0.3, START_AFTER = 0.2, MIN_SPEECH = 0.3, MAX_UTT = 30;
 // Filler backchannel: when you pause this long mid-turn (but haven't finished), the AI says a fixed "うん" (no LLM).
 // Speculative reply: after SPEC_AT of silence the LLM starts on what you said so far, but the reply is only held.
