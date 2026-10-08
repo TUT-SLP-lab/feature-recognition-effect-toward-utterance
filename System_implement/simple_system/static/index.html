@@ -1,0 +1,541 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Simple Voice Chat</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>🎤</text></svg>">
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1d2129; --muted:#6b7280; --accent:#2563eb; --user:#e8f0fe; --bot:#f1f3f5; --rec:#dc2626; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#14161a; --card:#1d2026; --text:#e6e8eb; --muted:#9aa1ab; --accent:#5b8def; --user:#23314d; --bot:#262a31; --rec:#ef4444; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui, sans-serif; }
+  main { max-width:760px; margin:0 auto; padding:16px; display:grid; gap:12px; }
+  .card { background:var(--card); border-radius:12px; padding:14px; box-shadow:0 1px 3px rgba(0,0,0,.12); }
+  h1 { font-size:18px; margin:0; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:end; }
+  label { display:grid; gap:4px; font-size:12px; color:var(--muted); }
+  select, input[type=text], button { font:inherit; padding:8px 10px; border-radius:8px; border:1px solid #8884; background:var(--card); color:var(--text); }
+  input[type=range] { width:140px; }
+  button { cursor:pointer; }
+  button.primary { background:var(--accent); color:#fff; border-color:transparent; }
+  button.rec { background:var(--rec); color:#fff; border-color:transparent; }
+  button:disabled { opacity:.5; cursor:default; }
+  #log { display:grid; gap:8px; min-height:240px; max-height:50vh; overflow:auto; align-content:start; }
+  .msg { padding:8px 12px; border-radius:10px; max-width:85%; white-space:pre-wrap; }
+  .msg.user { background:var(--user); justify-self:end; }
+  .msg.bot { background:var(--bot); justify-self:start; }
+  .msg.backchannel { background:var(--user); justify-self:end; opacity:.55; font-style:italic; }
+  #state { display:flex; align-items:center; gap:14px; padding:14px 18px; border-radius:12px; color:#fff; background:var(--c); transition:background .2s; }
+  #state .dot { width:18px; height:18px; border-radius:50%; background:#fff; flex:none; }
+  #state .label { font-size:22px; font-weight:700; line-height:1.2; }
+  #state .sub { font-size:13px; opacity:.85; }
+  #state[data-s=off] { --c:#6b7280; } #state[data-s=off] .dot { opacity:.5; }
+  #state[data-s=listening] { --c:#16a34a; } #state[data-s=listening] .dot { animation:pulse 1.6s ease-in-out infinite; }
+  #state[data-s=hearing] { --c:#2563eb; } #state[data-s=hearing] .dot { animation:pulse .5s ease-in-out infinite; }
+  #state[data-s=transcribing], #state[data-s=thinking] { --c:#d97706; } #state[data-s=transcribing] .dot, #state[data-s=thinking] .dot { animation:pulse .9s ease-in-out infinite; }
+  #state[data-s=speaking] { --c:#7c3aed; } #state[data-s=speaking] .dot { animation:pulse .7s ease-in-out infinite; }
+  #state[data-s=error] { --c:#dc2626; }
+  @keyframes pulse { 50% { transform:scale(1.5); opacity:.45; } }
+  .tabs { display:flex; gap:6px; }
+  .tabs button.active { background:var(--accent); color:#fff; border-color:transparent; }
+  .kv { display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:6px 14px; font-size:13px; }
+  .kv b { display:block; font-size:11px; font-weight:400; color:var(--muted); }
+  .tbl { width:100%; border-collapse:collapse; font-size:13px; }
+  .tbl td { padding:4px 6px; border-top:1px solid #8883; vertical-align:middle; }
+  .role { font-weight:600; font-size:11px; padding:1px 7px; border-radius:99px; color:#fff; }
+  .role.user { background:#2563eb; } .role.ai { background:#7c3aed; } .role.backchannel { background:#d97706; } .role.event { background:#6b7280; }
+  #dbglog { font:12px/1.5 ui-monospace,monospace; max-height:240px; overflow:auto; white-space:pre-wrap; }
+  #dbglog .bc { color:#d97706; font-weight:600; } #dbglog .warn { color:var(--rec); }
+  #status { color:var(--muted); font-size:13px; min-height:20px; }
+  #text { flex:1; min-width:200px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Voice Chat — Kotoba-Whisper → LLM → Style-Bert-VITS2</h1>
+
+  <div class="tabs">
+    <button id="tab-chat" class="active">Chat</button>
+    <button id="tab-debug">Debug</button>
+  </div>
+
+  <div id="state" data-s="off"><span class="dot"></span><div><div class="label">Mic off</div><div class="sub">Press “Start conversation”</div></div></div>
+
+  <div id="view-chat">
+  <section class="card row">
+    <label>TTS model
+      <select id="model"></select>
+    </label>
+    <label>Style
+      <select id="style"></select>
+    </label>
+    <label>Style weight: <span id="swv">5.0</span>
+      <input id="sw" type="range" min="0" max="20" step="0.5" value="5">
+    </label>
+    <label>Length (speed): <span id="lenv">1.0</span>
+      <input id="len" type="range" min="0.6" max="1.6" step="0.05" value="1">
+    </label>
+    <label>Mic threshold: <span id="thv">0.020</span>
+      <input id="th" type="range" min="0.005" max="0.1" step="0.005" value="0.02">
+    </label>
+    <label>Mic level
+      <progress id="lvl" max="0.1" value="0" style="width:140px"></progress>
+    </label>
+    <button id="reset">Reset chat</button>
+  </section>
+
+  <section class="card"><div id="log"></div></section>
+
+  </div>
+
+  <div id="view-debug" hidden>
+    <section class="card">
+      <h2 style="font-size:14px;margin:0 0 8px">Live state <small style="color:var(--muted)">— speak a short “うん” while the AI is talking to test backchannel</small></h2>
+      <div class="kv" id="live"></div>
+    </section>
+    <section class="card">
+      <h2 style="font-size:14px;margin:0 0 8px">Backchannel logging test <small style="color:var(--muted)">— no LLM</small></h2>
+      <div class="row" style="align-items:center">
+        <label style="display:flex;flex-direction:row;align-items:center;gap:6px;color:var(--text);font-size:14px">
+          <input id="dbg-test" type="checkbox"> Test mode: AI speaks random canned sentences instead of calling the LLM
+        </label>
+        <button id="dbg-speak" class="primary">▶ Speak a test sentence</button>
+      </div>
+      <div style="color:var(--muted);font-size:12px;margin-top:6px">
+        1) Press <b>Start conversation</b>. 2) Press <b>Speak a test sentence</b>. 3) While it talks, say short “うん / へえ” (under the interrupt time).
+        4) Check <b>Saved log</b> below for <span class="role backchannel">backchannel</span> rows with audio. Speaking longer than the interrupt time cuts the AI off and gets another random sentence.
+      </div>
+    </section>
+    <section class="card row">
+      <label>Interrupt after (s) — shorter speech = backchannel
+        <input id="dbg-barge" type="number" min="0.3" max="5" step="0.1" value="1.0">
+      </label>
+      <label>End of speech silence (s)
+        <input id="dbg-end" type="number" min="0.3" max="3" step="0.1" value="1.0">
+      </label>
+      <label>Filler “うん” at silence (s)
+        <input id="dbg-filler-at" type="number" min="0.3" max="3" step="0.1" value="0.8">
+      </label>
+      <label style="flex-direction:row;align-items:center;gap:6px;color:var(--text);font-size:14px">
+        <input id="dbg-filler-on" type="checkbox" checked> Filler backchannel on pauses
+      </label>
+    </section>
+    <section class="card">
+      <h2 style="font-size:14px;margin:0 0 8px">Decisions <small style="color:var(--muted)">(this browser)</small> <button id="dbg-clear" style="float:right;padding:2px 8px">Clear</button></h2>
+      <div id="dbglog"></div>
+    </section>
+    <section class="card">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <h2 style="font-size:14px;margin:0">Saved log <small id="dbg-sess" style="color:var(--muted)"></small></h2>
+        <label style="display:flex;flex-direction:row;align-items:center;gap:6px">
+          <input id="dbg-bconly" type="checkbox"> backchannel only
+        </label>
+      </div>
+      <div id="dbg-count" style="color:var(--muted);font-size:12px;margin:4px 0"></div>
+      <table class="tbl"><tbody id="dbg-rows"></tbody></table>
+    </section>
+  </div>
+
+  <section class="card">
+    <div class="row">
+      <button id="mic" class="primary">🎙 Start conversation</button>
+      <input id="text" type="text" placeholder="…or type a message and press Enter (headphones recommended for voice)">
+      <button id="send">Send</button>
+    </div>
+    <div id="status"></div>
+    <audio id="player" controls hidden></audio>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let models = [];
+
+const STATES = [  // status text prefix -> [state, label, hint]
+  ["Listening to you", "hearing", "Hearing you…", "I'm listening to what you say"],
+  ["Listening", "listening", "Listening", "Go ahead and speak"],
+  ["Transcribing", "transcribing", "Transcribing…", "Converting your speech to text"],
+  ["Thinking", "thinking", "Thinking…", "Waiting for the AI's reply"],
+  ["Speaking", "speaking", "AI speaking", "Speak for ~1 s to interrupt; short remarks are noted as backchannel"],
+  ["Error", "error", "Error", ""],
+  ["Mic error", "error", "Mic error", ""],
+  ["Could not", "error", "Error", ""],
+  ["Browser blocked", "error", "Autoplay blocked", ""],
+  ["", "off", "Mic off", "Press “Start conversation”"],
+];
+const setStatus = s => {
+  $("status").textContent = s;
+  const m = STATES.find(([p]) => p ? s.startsWith(p) : s === "");
+  if (!m) return;  // e.g. "Chat reset." keeps the current state
+  $("state").dataset.s = m[1];
+  $("state").querySelector(".label").textContent = m[2];
+  $("state").querySelector(".sub").textContent = m[1] === "error" ? s : m[3];
+};
+const addMsg = (who, text) => {
+  const d = document.createElement("div");
+  d.className = "msg " + who; d.textContent = text;
+  $("log").append(d); $("log").scrollTop = $("log").scrollHeight;
+};
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error((await r.text()).slice(0, 300));
+  return r;
+}
+
+async function loadModels() {
+  models = await (await api("/api/models")).json();
+  $("model").innerHTML = models.map(m => `<option value="${m.id}">${m.name} — ${m.checkpoint}</option>`).join("");
+  const saved = localStorage.getItem("sbv2_model");
+  if (saved && models.some(m => m.id === saved)) $("model").value = saved;
+  fillStyles();
+}
+function fillStyles() {
+  const m = models.find(m => m.id === $("model").value);
+  $("style").innerHTML = (m ? m.styles : []).map(s => `<option>${s}</option>`).join("");
+}
+$("model").onchange = () => { localStorage.setItem("sbv2_model", $("model").value); fillStyles(); };
+$("sw").oninput = () => $("swv").textContent = (+$("sw").value).toFixed(1);
+$("len").oninput = () => $("lenv").textContent = (+$("len").value).toFixed(2);
+
+// Play a silent clip inside a click handler so the browser lets later playback through.
+const SILENT_WAV = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=";
+function unlockAudio() {
+  const a = $("player");
+  a.onended = null; a.src = SILENT_WAV;
+  a.play().catch(() => {});
+}
+
+// Queue of sentence audio clips, played back-to-back as they arrive from the stream.
+// While the mic recording runs, the real start/stop time of each clip is reported (on the recording's clock)
+// so the server can build an AI track with the same timeline as the human recording.
+const queue = []; let playing = false, idleWaiters = [], cur = null;
+function enqueue(url, id, filler = false) { queue.push({ url, id, filler }); if (!playing) playNext(); }
+function reportClip(completed) {
+  const c = cur; cur = null;
+  if (!c || c.start == null || !listening) return;  // never actually heard, or no mic timeline
+  const body = JSON.stringify({ id: c.id, start_s: c.start / rec.sr, end_s: rec.total / rec.sr, completed });
+  rec.chain = rec.chain.then(() => fetch("/api/play_event", { method: "POST", headers: {"Content-Type": "application/json"}, body })).catch(() => {});
+}
+$("player").onplaying = () => { if (cur && cur.start == null) cur.start = rec.total; };  // audio really started
+async function playNext() {
+  reportClip(true);
+  const item = queue.shift();
+  if (!item) { playing = false; idleWaiters.splice(0).forEach(f => f()); return; }
+  playing = true; cur = { id: item.id, start: null, filler: item.filler };
+  $("player").src = item.url; $("player").onended = playNext;
+  try { await $("player").play(); }
+  catch (e) {
+    if (e.name !== "NotAllowedError") return;  // pause() from stopPlayback
+    stopPlayback();
+    $("player").hidden = false;
+    setStatus("Browser blocked autoplay — press play below.");
+  }
+}
+function stopPlayback() {
+  if (cur) reportClip(false);  // cut off mid-clip: report how much was heard
+  queue.length = 0; playing = false; $("player").onended = null; $("player").pause();
+  idleWaiters.splice(0).forEach(f => f());
+}
+const whenIdle = () => playing ? new Promise(r => idleWaiters.push(r)) : Promise.resolve();
+
+// ---------- conversation turns ----------
+let chatCtrl = null, unanswered = [], asrQueue = Promise.resolve(), asrPending = 0;  // unanswered: user texts not yet answered
+const idleStatus = () => listening ? "Listening…" : "";
+
+// Stop the bot: abort the running reply, drop queued audio, tell the server.
+function bargeIn() {
+  epoch++;  // drops any filler that is still being fetched
+  if (chatCtrl) { chatCtrl.abort(); chatCtrl = null; }
+  stopPlayback();
+  fetch("/api/interrupt", { method: "POST" }).catch(() => {});
+}
+
+async function chatTurn() {
+  const texts = unanswered.slice(), text = texts.join(""), ctrl = new AbortController();
+  chatCtrl = ctrl;
+  setStatus("Thinking…");
+  let bubble = null, buf = "", got = false;
+  const handle = line => {
+    if (!line.trim()) return;
+    const { text: sentence, audio, id } = JSON.parse(line);
+    if (!got) { got = true; unanswered.splice(0, texts.length); }  // answered (at least partly)
+    if (!bubble) { addMsg("bot", ""); bubble = $("log").lastChild; }
+    bubble.textContent += sentence; $("log").scrollTop = $("log").scrollHeight;
+    enqueue(URL.createObjectURL(new Blob([Uint8Array.from(atob(audio), c => c.charCodeAt(0))], { type: "audio/wav" })), id);
+    setStatus("Speaking…");
+  };
+  try {
+    const r = await api("/api/chat_stream", {
+      method: "POST", headers: {"Content-Type": "application/json"}, signal: ctrl.signal,
+      body: JSON.stringify({ text, test: $("dbg-test").checked, model: $("model").value, style: $("style").value,
+                             style_weight: +$("sw").value, length: +$("len").value }),
+    });
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const lines = buf.split("\n"); buf = lines.pop();
+      lines.forEach(handle);
+    }
+    handle(buf);
+    await whenIdle();
+  } catch (e) {
+    if (e.name !== "AbortError") setStatus("Error: " + e.message);
+  } finally {
+    if (chatCtrl === ctrl) chatCtrl = null;
+    if (!ctrl.signal.aborted) setStatus(idleStatus());
+  }
+}
+
+// A finished utterance from the mic. Transcription runs strictly in order so text is never reordered or lost;
+// the bot answers once everything you said is transcribed and you've stopped talking.
+function handleUtterance(wav, backchannel = false, offset = null) {
+  asrPending++;
+  asrQueue = asrQueue.then(() => transcribe(wav, backchannel, offset)).finally(() => { asrPending--; maybeAnswer(); });
+}
+
+async function transcribe(wav, backchannel, offset) {
+  if (!backchannel) setStatus("Transcribing…");
+  try {
+    const fd = new FormData(); fd.append("audio", wav, "utt.wav"); fd.append("kind", backchannel ? "backchannel" : "user");
+    if (offset != null) fd.append("offset", offset);
+    const { text } = await (await api("/api/asr", { method: "POST", body: fd })).json();
+    dbg(`ASR (${backchannel ? "backchannel" : "user"}): ${text ? JSON.stringify(text) : "empty — not logged"}`, backchannel ? "bc" : "");
+    if (text && backchannel) addMsg("backchannel", text);   // shown only; doesn't trigger a reply
+    else if (text) { addMsg("user", text); unanswered.push(text); }
+  } catch (e) { setStatus("Error: " + e.message); }
+}
+
+function maybeAnswer() {
+  if (asrPending > 0 || vad.state === "speech" || chatCtrl) return;  // more of your speech is coming / in progress
+  if (unanswered.length) chatTurn(); else setStatus(idleStatus());
+}
+
+$("send").onclick = () => {
+  const t = $("text").value.trim(); if (!t) return;
+  unlockAudio(); bargeIn();
+  $("text").value = ""; addMsg("user", t); unanswered.push(t); chatTurn();
+  fetch("/api/typed", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ text: t }) }).catch(() => {});
+};
+$("text").onkeydown = e => { if (e.key === "Enter" && !e.isComposing) $("send").click(); };
+$("th").oninput = () => $("thv").textContent = (+$("th").value).toFixed(3);
+
+// ---------- always-on mic with simple energy VAD ----------
+let END_AFTER = 1.0;  // silence that ends your turn (was 0.8)
+const PRE_ROLL = 0.3, START_AFTER = 0.2, MIN_SPEECH = 0.3, MAX_UTT = 30;
+// Filler backchannel: when you pause this long mid-turn (but haven't finished), the AI says a fixed "うん" (no LLM).
+let FILLER_ON = true, FILLER_AT = 0.8;
+const FILLERS = ["うん。", "うんうん。", "うん、うん。"], FILLER_MIN_SPEECH = 0.6, FILLER_COOLDOWN = 4000;
+let lastFiller = 0, epoch = 0;
+let BARGE_AFTER = 1.0;  // while the bot is talking, only speech longer than this interrupts it; shorter = backchannel
+let listening = false, micCtx = null, micStream = null;
+const vad = { state: "idle", pre: [], preT: 0, utt: [], uttT: 0, loud: 0, quiet: 0, overBot: false };
+
+function encodeWav(frames, sr) {
+  const n = frames.reduce((a, f) => a + f.length, 0);
+  const view = new DataView(new ArrayBuffer(44 + n * 2));
+  const str = (o, s) => [...s].forEach((c, i) => view.setUint8(o + i, c.charCodeAt(0)));
+  str(0, "RIFF"); view.setUint32(4, 36 + n * 2, true); str(8, "WAVEfmt ");
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, sr, true); view.setUint32(28, sr * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  str(36, "data"); view.setUint32(40, n * 2, true);
+  let o = 44;
+  for (const f of frames) for (const x of f) { view.setInt16(o, Math.max(-1, Math.min(1, x)) * 32767, true); o += 2; }
+  return new Blob([view], { type: "audio/wav" });
+}
+
+// Continuous recording of everything the mic hears: raw PCM is posted to the server about once a second
+// and appended to one long WAV. rec.total (samples since the recording started) lets log entries point into it.
+const rec = { buf: [], n: 0, total: 0, sr: 48000, start: true, chain: Promise.resolve() };
+function flushRec() {
+  if (!rec.n) return;
+  const pcm = new Int16Array(rec.n); let o = 0;
+  for (const f of rec.buf) for (const x of f) pcm[o++] = Math.max(-1, Math.min(1, x)) * 32767;
+  rec.buf = []; rec.n = 0;
+  const url = `/api/mic_chunk?sr=${rec.sr}&start=${rec.start ? 1 : 0}`; rec.start = false;
+  rec.chain = rec.chain.then(() => fetch(url, { method: "POST", body: pcm.buffer })).catch(() => {});  // in order, never blocks the UI
+}
+
+function onFrame(f) {
+  rec.total += f.length; rec.buf.push(f); rec.n += f.length;
+  if (rec.n >= rec.sr) flushRec();
+  const dur = f.length / micCtx.sampleRate, th = +$("th").value;
+  let sum = 0; for (const x of f) sum += x * x;
+  const rms = Math.sqrt(sum / f.length);
+  $("lvl").value = rms;
+
+  if (vad.state === "idle") {
+    vad.pre.push(f); vad.preT += dur;
+    while (vad.preT > PRE_ROLL) vad.preT -= vad.pre.shift().length / micCtx.sampleRate;
+    vad.loud = rms > th ? vad.loud + dur : 0;
+    if (vad.loud >= START_AFTER) {
+      vad.state = "speech"; vad.utt = vad.pre.slice(); vad.uttT = vad.preT; vad.quiet = 0;
+      vad.pre = []; vad.preT = 0;
+      vad.fillerSent = false;
+      vad.startSample = rec.total - vad.utt.reduce((a, x) => a + x.length, 0);  // where this utterance starts in the full recording
+      vad.overBot = !!chatCtrl;              // bot is generating / speaking: don't interrupt yet
+      dbg(`speech start — bot ${vad.overBot ? "BUSY → holding (possible backchannel)" : "idle → normal turn"}`);
+      if (vad.overBot) setStatus("Speaking… (hearing you)"); else { bargeIn(); setStatus("Listening to you…"); }
+    }
+    return;
+  }
+  vad.utt.push(f); vad.uttT += dur;
+  // While our own filler plays, a bit of it can leak into the mic: only clearly louder sound counts as you speaking.
+  const heard = rms > (cur && cur.filler ? th * 3 : th);
+  if (heard) vad.fillerSent = false;
+  vad.quiet = heard ? 0 : vad.quiet + dur;
+  if (FILLER_ON && !vad.overBot && !vad.fillerSent && vad.quiet >= FILLER_AT && vad.quiet < END_AFTER
+      && vad.uttT - vad.quiet >= FILLER_MIN_SPEECH && Date.now() - lastFiller > FILLER_COOLDOWN) {
+    vad.fillerSent = true; lastFiller = Date.now(); fillerBackchannel();
+  }
+  if (vad.overBot && vad.uttT - vad.quiet >= BARGE_AFTER) {   // not a backchannel: real interruption
+    dbg(`speech ≥ ${BARGE_AFTER}s while bot busy → INTERRUPT`, "warn");
+    vad.overBot = false; bargeIn(); setStatus("Listening to you…");
+  }
+  if (vad.quiet >= END_AFTER || vad.uttT >= MAX_UTT) {
+    const speech = vad.uttT - vad.quiet, frames = vad.utt, sr = micCtx.sampleRate, offset = vad.startSample / sr;
+    // Short speech while the bot is still talking = backchannel: transcribe and show it, but don't reply.
+    const backchannel = vad.overBot && !!chatCtrl;
+    dbg(`speech end — ${speech.toFixed(2)}s → ` + (backchannel ? "BACKCHANNEL" : speech >= MIN_SPEECH
+      ? (vad.overBot ? "normal turn (bot finished meanwhile)" : "normal turn") : `discarded (noise, < ${MIN_SPEECH}s)`), backchannel ? "bc" : "");
+    Object.assign(vad, { state: "idle", utt: [], uttT: 0, loud: 0, quiet: 0, overBot: false, fillerSent: false });
+    if (backchannel) handleUtterance(encodeWav(frames, sr), true, offset);
+    else if (speech >= MIN_SPEECH) handleUtterance(encodeWav(frames, sr), false, offset);
+    else maybeAnswer();  // too short: noise
+  }
+}
+
+// You paused briefly but may not be done: the AI just says a fixed "うん" (cached TTS, no LLM) to show it's listening.
+async function fillerBackchannel() {
+  const text = FILLERS[Math.floor(Math.random() * FILLERS.length)], myEpoch = epoch;
+  dbg(`pause ≥ ${FILLER_AT}s (turn not over yet) → filler ${text}`, "bc");
+  try {
+    const r = await (await api("/api/filler", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ text, model: $("model").value, style: $("style").value,
+                             style_weight: +$("sw").value, length: +$("len").value }),
+    })).json();
+    if (myEpoch !== epoch) return;  // you started a new turn meanwhile
+    enqueue(URL.createObjectURL(new Blob([Uint8Array.from(atob(r.audio), c => c.charCodeAt(0))], { type: "audio/wav" })), r.id, true);
+  } catch (e) { dbg("filler failed: " + e.message, "warn"); }
+}
+
+async function startListening() {
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  });
+  micCtx = new AudioContext();
+  Object.assign(rec, { buf: [], n: 0, total: 0, sr: micCtx.sampleRate, start: true });  // new full recording
+  const code = `class Cap extends AudioWorkletProcessor {
+    process(inputs) { const c = inputs[0][0]; if (c) this.port.postMessage(c.slice()); return true; }
+  } registerProcessor("cap", Cap);`;
+  await micCtx.audioWorklet.addModule(URL.createObjectURL(new Blob([code], { type: "application/javascript" })));
+  const node = new AudioWorkletNode(micCtx, "cap"), mute = micCtx.createGain();
+  mute.gain.value = 0;                                  // keeps the node alive without echoing the mic
+  micCtx.createMediaStreamSource(micStream).connect(node).connect(mute).connect(micCtx.destination);
+  node.port.onmessage = e => onFrame(e.data);
+  Object.assign(vad, { state: "idle", pre: [], preT: 0, utt: [], uttT: 0, loud: 0, quiet: 0 });
+}
+
+function stopListening() {
+  flushRec();
+  rec.chain = rec.chain.then(() => fetch("/api/mic_end", { method: "POST" })).catch(() => {});  // after the last chunk and clip report
+  micStream.getTracks().forEach(t => t.stop());
+  micCtx.close(); micCtx = micStream = null; $("lvl").value = 0;
+}
+
+$("mic").onclick = async () => {
+  unlockAudio();
+  try {
+    if (listening) { bargeIn(); listening = false; stopListening(); $("mic").textContent = "🎙 Start conversation"; $("mic").className = "primary"; setStatus(""); }
+    else { await startListening(); listening = true; $("mic").textContent = "⏹ Stop conversation"; $("mic").className = "rec"; setStatus("Listening…"); }
+  } catch (e) { setStatus("Mic error: " + e.message); }
+};
+
+// ---------- tabs + debug ----------
+const dbgLines = [];
+function dbg(msg, cls = "") {
+  const t = new Date().toLocaleTimeString("ja-JP", { hour12: false }) + "." + String(Date.now() % 1000).padStart(3, "0");
+  dbgLines.push(`<div class="${cls}">[${t}] ${msg.replace(/</g, "&lt;")}</div>`);
+  if (dbgLines.length > 150) dbgLines.shift();
+  const el = $("dbglog"); if (!el) return;
+  const atEnd = el.scrollTop + el.clientHeight >= el.scrollHeight - 5;
+  el.innerHTML = dbgLines.join(""); if (atEnd) el.scrollTop = el.scrollHeight;
+}
+// Test mode logs to logs/debug/, normal chat to logs/normal/: switching starts a fresh session (and full mic recording).
+let logKind = "normal";
+async function setTestMode(on) {
+  $("dbg-test").checked = on;
+  const kind = on ? "debug" : "normal";
+  if (kind === logKind) return;
+  logKind = kind;
+  bargeIn();  // stop any playing clip (and report it) before the recording timeline restarts
+  flushRec(); await rec.chain;  // finish the old session's recording first
+  await api("/api/session?kind=" + kind, { method: "POST" });
+  Object.assign(rec, { buf: [], n: 0, total: 0, start: true });
+  lastRows = ""; refreshDebug();
+}
+$("dbg-test").onchange = () => setTestMode($("dbg-test").checked).catch(e => setStatus("Error: " + e.message));
+$("dbg-speak").onclick = async () => {
+  unlockAudio(); await setTestMode(true);
+  if (!listening) setStatus("Tip: press Start conversation first, so your backchannel can be recorded.");
+  bargeIn(); chatTurn();
+};
+$("dbg-clear").onclick = () => { dbgLines.length = 0; $("dbglog").innerHTML = ""; };
+$("dbg-barge").onchange = () => BARGE_AFTER = +$("dbg-barge").value;
+$("dbg-end").onchange = () => END_AFTER = +$("dbg-end").value;
+$("dbg-filler-at").onchange = () => FILLER_AT = +$("dbg-filler-at").value;
+$("dbg-filler-on").onchange = () => FILLER_ON = $("dbg-filler-on").checked;
+
+function showTab(name) {
+  $("view-chat").hidden = name !== "chat"; $("view-debug").hidden = name !== "debug";
+  $("tab-chat").classList.toggle("active", name === "chat"); $("tab-debug").classList.toggle("active", name === "debug");
+  if (name === "debug") refreshDebug();
+}
+$("tab-chat").onclick = () => showTab("chat"); $("tab-debug").onclick = () => showTab("debug");
+
+function renderLive() {
+  const kv = (k, v) => `<div><b>${k}</b>${v}</div>`;
+  $("live").innerHTML = [
+    kv("mic", listening ? "on" : "off"), kv("VAD state", vad.state), kv("mic level", $("lvl").value.toFixed(3) + " / th " + $("th").value),
+    kv("speaking over bot", vad.overBot), kv("bot busy (generating/playing)", !!chatCtrl), kv("audio playing", playing),
+    kv("queued clips", queue.length), kv("ASR pending", asrPending), kv("unanswered texts", unanswered.length),
+    kv("full recording (s)", listening ? (rec.total / rec.sr).toFixed(1) : "–"), kv("current speech (s)", vad.state === "speech" ? (vad.uttT - vad.quiet).toFixed(2) : "–"),
+  ].join("");
+}
+let lastRows = "";
+async function refreshDebug() {
+  try {
+    const d = await (await api("/api/debug/log")).json();
+    const only = $("dbg-bconly").checked, esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+    const n = r => d.entries.filter(e => e.role === r).length;
+    $("dbg-sess").textContent = `— ${d.session}` + (d.pending_writes ? ` (${d.pending_writes} writes pending)` : "");
+    $("dbg-count").textContent = `${d.entries.length} entries: ${n("user")} user, ${n("backchannel")} backchannel, ${n("ai")} ai, ${n("event")} events`;
+    const rows = d.entries.filter(e => !only || e.role === "backchannel").reverse().map(e =>
+      `<tr><td>${e.time.slice(11, 23)}</td><td><span class="role ${e.role}">${e.role}</span></td><td>${esc(e.text)}</td>` +
+      `<td>${e.audio ? `<audio controls preload="none" src="/api/debug/audio/${e.audio.replace(/^audio\//, "")}" style="height:28px"></audio>` : ""}` +
+      (e.full_audio ? `<div style="font-size:11px;color:var(--muted)">${e.full_audio.replace(/^audio\//, "")} @ ${e.full_offset_s}s</div>` : "") + `</td></tr>`
+    ).join("");
+    if (rows !== lastRows) { $("dbg-rows").innerHTML = rows; lastRows = rows; }  // don't rebuild while a clip is playing
+  } catch (e) { $("dbg-count").textContent = "Could not load log: " + e.message; }
+}
+$("dbg-bconly").onchange = () => { lastRows = ""; refreshDebug(); };
+setInterval(() => { if (!$("view-debug").hidden) { renderLive(); } }, 200);
+setInterval(() => { if (!$("view-debug").hidden) refreshDebug(); }, 2000);
+
+$("reset").onclick = async () => {
+  bargeIn(); unanswered = [];
+  flushRec(); await rec.chain;  // finish the old session's recording first
+  await api("/api/reset", { method: "POST" });
+  Object.assign(rec, { buf: [], n: 0, total: 0, start: true });  // new session = new full recording $("log").innerHTML = ""; setStatus("Chat reset.");
+};
+
+api("/api/session?kind=normal", { method: "POST" }).catch(() => {});  // page load = normal mode (checkbox is unticked)
+loadModels().catch(e => setStatus("Could not load models: " + e.message));
+</script>
+</body>
+</html>
