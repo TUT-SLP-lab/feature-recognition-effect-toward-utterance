@@ -28,6 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import librosa
 import numpy as np
 import soundfile as sf
 import torch
@@ -64,13 +65,10 @@ MODEL_ASSETS = SBV2_DIR / "model_assets"
 
 SYSTEM_PROMPT = """\
 あなたは「あおい」、25歳の女性です。
-相手は24歳の男性です。
-あなた相手と日常会話をしています。
-話題は一度行ってみたい旅行先です。
+あなたは自分の前の海外旅行での思い出について話しています。
 返事は1〜2文の短い話し言葉で答えてください。
-質問以外、自分のことも話してください。
-時々今の話題に近い話題に切り替えてもいいです。
-相手が話した言葉を繰り返さないようにしてください
+質問を少なくし、自分のことも話してください。
+相手が話した言葉を繰り返さないようにしてください。
 """
 
 # ---------------- load models once at startup ----------------
@@ -613,8 +611,27 @@ def trim_silence(wav: np.ndarray, sr: int, thr: float = 0.01, lead_ms: int = 30,
     return wav[max(0, loud[0] - lead_ms * sr // 1000): min(len(wav), loud[-1] + 1 + tail_ms * sr // 1000)]
 
 
-def synth(req: TTSRequest) -> bytes:
-    """Text -> WAV bytes (silence at both ends trimmed)."""
+# Final lengthening on the last particle of a chunk: the chunk is synthesized in ONE pass (so it stays continuous),
+# then the last TAIL_MS of the audio is time-stretched by TAIL_STRETCH (pitch kept) and cross-faded back in.
+TAIL_PARTICLE = re.compile(r"(ね|さ|よ|けど|けれど|が|て)[。、]?$")
+TAIL_MS, TAIL_STRETCH, TAIL_FADE_MS = 200, 1.7, 20
+
+
+def lengthen_tail(wav: np.ndarray, sr: int, tail_ms: int = TAIL_MS, stretch: float = TAIL_STRETCH) -> np.ndarray:
+    n, f = int(tail_ms * sr / 1000), int(TAIL_FADE_MS * sr / 1000)
+    if len(wav) < 3 * n:
+        return wav
+    x = wav.astype(np.float32)
+    tail = librosa.effects.time_stretch(x[-n - f:], rate=1 / stretch)  # includes the cross-fade overlap
+    ramp = np.linspace(0, 1, f, dtype=np.float32)
+    head = x[:-n - f]
+    mid = x[-n - f:-n] * (1 - ramp) + tail[:f] * ramp  # blend original -> stretched
+    out = np.concatenate([head, mid, tail[f:]])
+    return out.astype(wav.dtype) if np.issubdtype(wav.dtype, np.integer) else out
+
+
+def synth_raw(req: TTSRequest) -> tuple[np.ndarray, int]:
+    """Text -> (trimmed samples, sample rate), before any final lengthening."""
     model = get_tts(req.model)
     style = req.style if req.style in model.style2id else next(iter(model.style2id))
     # SBV2's g2p crashes on "!" before more text ("Input must be katakana only: ！"), so use "。" instead.
@@ -622,9 +639,46 @@ def synth(req: TTSRequest) -> bytes:
     sr, wav = model.infer(
         text=text, language=Languages.JP, style=style, style_weight=req.style_weight, length=req.length,
     )
+    return trim_silence(wav, sr), sr
+
+
+def to_wav_bytes(wav: np.ndarray, sr: int) -> bytes:
     buf = io.BytesIO()
-    sf.write(buf, trim_silence(wav, sr), sr, format="WAV")
+    sf.write(buf, wav, sr, format="WAV")
     return buf.getvalue()
+
+
+def synth(req: TTSRequest) -> bytes:
+    """Text -> WAV bytes (silence at both ends trimmed, final particle lengthened)."""
+    wav, sr = synth_raw(req)
+    if TAIL_PARTICLE.search(req.text):
+        wav = lengthen_tail(wav, sr)
+    return to_wav_bytes(wav, sr)
+
+
+class LengthenTestRequest(TTSRequest):
+    text: str = ""  # unused (inherited, but the texts come from `texts`)
+    texts: list[str]
+    tail_ms: int = TAIL_MS
+    stretch: float = TAIL_STRETCH
+
+
+@app.post("/api/lengthen_test")
+def api_lengthen_test(req: LengthenTestRequest):
+    """Debug: for each text, ONE synthesis, returned both as-is and with final lengthening, so the two differ only by the stretch."""
+    out = []
+    for text in req.texts:
+        text = text.strip()
+        if not text:
+            continue
+        wav, sr = synth_raw(req.model_copy(update={"text": text}))
+        applies = bool(TAIL_PARTICLE.search(text))
+        long = lengthen_tail(wav, sr, req.tail_ms, req.stretch) if applies else wav
+        out.append({"text": text, "applies": applies, "sr": sr,
+                    "plain_s": len(wav) / sr, "long_s": len(long) / sr,
+                    "plain": base64.b64encode(to_wav_bytes(wav, sr)).decode(),
+                    "long": base64.b64encode(to_wav_bytes(long, sr)).decode()})
+    return {"results": out}
 
 
 # Fixed "I'm listening" phrases the page plays when you pause briefly mid-turn (no LLM involved).
@@ -654,7 +708,9 @@ def api_tts(req: TTSRequest):
     return Response(audio, media_type="audio/wav")
 
 
-SENTENCE_END = re.compile(r"[^。！？!?\n]*[。！？!?\n]+")
+# Phrase chunking: a chunk ends at a sentence end, or at a comma that follows a final particle / clause-linking ending
+# (ne, sa, yo, -te, -kedo, ga). Each chunk is its own audio clip, so the page's fixed pause after it is the aizuchi slot.
+SENTENCE_END = re.compile(r"[^。！？!?\n]*?(?:(?:ね|さ|よ|て|けど|けれど|が)、|[。！？!?\n]+)")
 
 
 # ---- LLM latency benchmark (Debug tab) ----

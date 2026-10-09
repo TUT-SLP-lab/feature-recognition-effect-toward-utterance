@@ -82,7 +82,7 @@
       <input id="len" type="range" min="0.6" max="1.6" step="0.05" value="1">
     </label>
     <label>Pause between sentences: <span id="pausev">250</span> ms
-      <input id="pause" type="range" min="0" max="1500" step="50" value="250">
+      <input id="pause" type="range" min="300" max="500" step="50" value="300">
     </label>
     <label>Mic threshold: <span id="thv">0.020</span>
       <input id="th" type="range" min="0.005" max="0.1" step="0.005" value="0.02">
@@ -111,6 +111,25 @@
       </div>
       <div style="color:var(--muted);font-size:12px;margin:6px 0">Stop the conversation first (it shares the GPU). “First sentence” is what gates the voice; lower is better.</div>
       <div id="bench-out"></div>
+    </section>
+    <section class="card">
+      <h2 style="font-size:14px;margin:0 0 8px">Final lengthening A/B <small style="color:var(--muted)">— same synthesis, with and without the stretched ending</small></h2>
+      <textarea id="ll-text" rows="7" style="width:100%;box-sizing:border-box">昨日ね、近所の公園に行ってさ、
+桜がちょうど満開だったんだよ。
+それでね、帰りにパン屋さんに寄ったんだけど、
+焼きたてのクロワッサンがすごくおいしかったよ。
+海外旅行のときもね、朝ごはんが楽しみでさ、
+毎朝その土地のパンを食べてたんだ。
+あなたはどんな旅行が好きなの。</textarea>
+      <div style="color:var(--muted);font-size:12px;margin:4px 0">One chunk per line (LLM-style phrases ending in ね / さ / よ / て / けど). The last line has no particle, so both versions are identical.</div>
+      <div class="row" style="align-items:center">
+        <label>Tail length: <span id="ll-msv">200</span> ms <input id="ll-ms" type="range" min="80" max="400" step="20" value="200"></label>
+        <label>Stretch: ×<span id="ll-stv">1.5</span> <input id="ll-st" type="range" min="1.1" max="2.5" step="0.1" value="1.5"></label>
+        <button id="ll-run" class="primary">▶ Generate</button>
+        <button id="ll-seq">▶▶ Play all (plain → lengthened, 400 ms gap)</button>
+        <span id="ll-status" style="color:var(--muted);font-size:13px"></span>
+      </div>
+      <table class="tbl" style="margin-top:8px"><thead><tr><th align="left">Text</th><th>Plain</th><th>Lengthened</th><th>Δ length</th></tr></thead><tbody id="ll-rows"></tbody></table>
     </section>
     <section class="card">
       <h2 style="font-size:14px;margin:0 0 8px">Backchannel logging test <small style="color:var(--muted)">— no LLM</small></h2>
@@ -243,8 +262,8 @@ function reportClip(completed) {
 }
 $("player").onplaying = () => { if (cur && cur.start == null) cur.start = rec.total; };  // audio really started
 // Silence between sentences = the page's pause + about 0.15 s left at the clip edges (the voice's own ~0.4 s padding is trimmed).
-let PAUSE_MS = 250, playEpoch = 0;
-try { const v = localStorage.getItem("pause_ms"); if (v !== null) PAUSE_MS = +v; } catch (e) {}
+let PAUSE_MS = 300, playEpoch = 0;  // fixed aizuchi slot: 300-500 ms (+~130 ms clip edges)
+try { const v = localStorage.getItem("pause_ms"); if (v !== null) PAUSE_MS = Math.min(500, Math.max(300, +v)); } catch (e) {}
 async function playNext(fromEnded = false) {
   reportClip(true);
   const item = queue.shift();
@@ -621,6 +640,33 @@ $("bench-run").onclick = async () => {
     $("bench-status").textContent = "done";
   } catch (e) { $("bench-status").textContent = "failed: " + e.message; }
   finally { $("bench-run").disabled = false; }
+};
+// ---------- final lengthening A/B ----------
+let llClips = [];
+$("ll-ms").oninput = () => $("ll-msv").textContent = $("ll-ms").value;
+$("ll-st").oninput = () => $("ll-stv").textContent = $("ll-st").value;
+$("ll-run").onclick = async () => {
+  $("ll-run").disabled = true; $("ll-status").textContent = "generating…";
+  try {
+    const d = await (await api("/api/lengthen_test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
+      texts: $("ll-text").value.split("\n"), model: $("model").value, style: $("style").value, style_weight: +$("sw").value, length: +$("len").value, tail_ms: +$("ll-ms").value, stretch: +$("ll-st").value }) })).json();
+    const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+    llClips = d.results.flatMap(r => [r.plain, r.long]);
+    $("ll-rows").innerHTML = d.results.map(r => `<tr><td>${esc(r.text)}${r.applies ? "" : " <small style='color:var(--muted)'>(no particle: identical)</small>"}</td>` +
+      `<td><audio controls preload="auto" src="data:audio/wav;base64,${r.plain}" style="height:30px"></audio></td>` +
+      `<td><audio controls preload="auto" src="data:audio/wav;base64,${r.long}" style="height:30px"></audio></td>` +
+      `<td align="right">${r.plain_s.toFixed(2)} → ${r.long_s.toFixed(2)} s (+${((r.long_s - r.plain_s) * 1000).toFixed(0)} ms)</td></tr>`).join("");
+    $("ll-status").textContent = "done";
+  } catch (e) { $("ll-status").textContent = "failed: " + e.message; }
+  finally { $("ll-run").disabled = false; }
+};
+$("ll-seq").onclick = async () => {
+  const a = new Audio();
+  for (const b64 of llClips) {
+    a.src = "data:audio/wav;base64," + b64;
+    await new Promise(r => { a.onended = r; a.onerror = r; a.play().catch(r); });
+    await new Promise(r => setTimeout(r, 400));
+  }
 };
 $("dbg-speak").onclick = async () => {
   unlockAudio(); await setTestMode(true);
