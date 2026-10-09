@@ -86,11 +86,14 @@
     <label>Style weight: <span id="swv">5.0</span>
       <input id="sw" type="range" min="0" max="20" step="0.5" value="5">
     </label>
-    <label>Length (speed): <span id="lenv">1.0</span>
-      <input id="len" type="range" min="0.6" max="1.6" step="0.05" value="1">
+    <label>Length (speed): <span id="lenv">0.85</span>
+      <input id="len" type="range" min="0.6" max="1.6" step="0.05" value="0.85">
     </label>
-    <label>Pause between sentences: <span id="pausev">250</span> ms
+    <label>Pause after a phrase (、): <span id="pausev">300</span> ms
       <input id="pause" type="range" min="300" max="500" step="50" value="300">
+    </label>
+    <label>Pause after a sentence (。): <span id="pausev2">850</span> ms
+      <input id="pause2" type="range" min="300" max="1500" step="50" value="850">
     </label>
     <label>Mic threshold: <span id="thv">0.020</span>
       <input id="th" type="range" min="0.005" max="0.1" step="0.005" value="0.02">
@@ -158,7 +161,7 @@
       <h2 style="font-size:14px;margin:0 0 8px">Phrase chunking <small style="color:var(--muted)">— sentence-level (old) vs phrase-level (new), with and without final lengthening, played with the same pause</small></h2>
       <textarea id="ck-text" rows="4" style="width:100%;box-sizing:border-box">昨日ね、近所の公園に行ってさ、桜がちょうど満開だったんだよ。それでね、帰りにパン屋さんに寄ったんだけど、焼きたてのクロワッサンがすごくおいしかったよ。
 海外旅行のときもね、朝ごはんが楽しみでさ、毎朝その土地のパンを食べてたんだ。あなたはどんな旅行が好きなの。</textarea>
-      <div style="color:var(--muted);font-size:12px;margin:4px 0">One LLM-style reply per line. Chunks are synthesized like live chat (only the last row has final lengthening, with the factors set above; ★ = stretched) and played with the “Pause between sentences” value from the Chat tab (<b id="ck-pause"></b> ms, plus about 130 ms at the clip edges).</div>
+      <div style="color:var(--muted);font-size:12px;margin:4px 0">One LLM-style reply per line. Chunks are synthesized like live chat (only the last row has final lengthening, with the factors set above; ★ = stretched) and played with the pause settings from the Chat tab: <b id="ck-pause"></b> ms after a phrase (、), <b id="ck-pause2"></b> ms after a sentence (。), plus about 130 ms at the clip edges.</div>
       <div class="row" style="align-items:center">
         <button id="ck-run" class="primary">▶ Generate</button>
         <button id="ck-stop">■ Stop</button>
@@ -288,7 +291,7 @@ function unlockAudio() {
 // While the mic recording runs, the real start/stop time of each clip is reported (on the recording's clock)
 // so the server can build an AI track with the same timeline as the human recording.
 const queue = []; let playing = false, idleWaiters = [], cur = null;
-function enqueue(url, id, filler = false) { queue.push({ url, id, filler }); if (!playing) playNext(); }
+function enqueue(url, id, filler = false, text = "") { queue.push({ url, id, filler, text }); if (!playing) playNext(); }
 function reportClip(completed) {
   const c = cur; cur = null;
   if (!c || c.start == null || !listening) return;  // never actually heard, or no mic timeline
@@ -297,19 +300,22 @@ function reportClip(completed) {
 }
 $("player").onplaying = () => { if (cur && cur.start == null) cur.start = rec.total; };  // audio really started
 // Silence between sentences = the page's pause + about 0.15 s left at the clip edges (the voice's own ~0.4 s padding is trimmed).
-let PAUSE_MS = 300, playEpoch = 0;  // fixed aizuchi slot: 300-500 ms (+~130 ms clip edges)
+let PAUSE_MS = 300, PAUSE_END_MS = 850, playEpoch = 0, lastPlayedText = "";  // aizuchi slots: after a phrase 300-500 ms, after a sentence longer (+~130 ms clip edges)
 try { const v = localStorage.getItem("pause_ms"); if (v !== null) PAUSE_MS = Math.min(500, Math.max(300, +v)); } catch (e) {}
+try { const v = localStorage.getItem("pause_end_ms"); if (v !== null) PAUSE_END_MS = Math.min(1500, Math.max(300, +v)); } catch (e) {}
+const pauseAfter = text => /[。！？!?]\s*$/.test(text || "") ? PAUSE_END_MS : PAUSE_MS;  // sentence end = a longer turn-taking slot
 async function playNext(fromEnded = false) {
   reportClip(true);
   const item = queue.shift();
   if (!item) { playing = false; idleWaiters.splice(0).forEach(f => f()); return; }
   playing = true;
-  if (fromEnded && PAUSE_MS > 0) {  // between two sentences of the same reply (never before the first one)
+  const gap = pauseAfter(lastPlayedText);
+  if (fromEnded && gap > 0) {  // between two clips of the same reply (never before the first one)
     const e = playEpoch;
-    await new Promise(r => setTimeout(r, PAUSE_MS));
+    await new Promise(r => setTimeout(r, gap));
     if (e !== playEpoch) return;    // you interrupted during the pause
   }
-  cur = { id: item.id, start: null, filler: item.filler };
+  cur = { id: item.id, start: null, filler: item.filler }; lastPlayedText = item.text;
   $("player").src = item.url; $("player").onended = () => playNext(true);
   try { await $("player").play(); }
   catch (e) {
@@ -376,7 +382,7 @@ function deliver(s, { text, audio, id }) {
   if (!s.got) { s.got = true; unanswered.splice(0, s.texts.length); }  // answered (at least partly)
   if (!s.bubble) { addMsg("bot", ""); s.bubble = $("log").lastChild; }
   s.bubble.textContent += text; $("log").scrollTop = $("log").scrollHeight;
-  enqueue(URL.createObjectURL(new Blob([Uint8Array.from(atob(audio), c => c.charCodeAt(0))], { type: "audio/wav" })), id);
+  enqueue(URL.createObjectURL(new Blob([Uint8Array.from(atob(audio), c => c.charCodeAt(0))], { type: "audio/wav" })), id, false, text);
   setStatus("Speaking…");
 }
 function commitStream(s) {  // your turn ended: release what is already ready, the rest plays as it arrives
@@ -479,6 +485,11 @@ $("send").onclick = () => {
 };
 $("text").onkeydown = e => { if (e.key === "Enter" && !e.isComposing) $("send").click(); };
 $("pause").value = PAUSE_MS; $("pausev").textContent = PAUSE_MS;
+$("pause2").value = PAUSE_END_MS; $("pausev2").textContent = PAUSE_END_MS;
+$("pause2").oninput = () => {
+  PAUSE_END_MS = +$("pause2").value; $("pausev2").textContent = PAUSE_END_MS;
+  try { localStorage.setItem("pause_end_ms", PAUSE_END_MS); } catch (e) {}
+};
 $("pause").oninput = () => {
   PAUSE_MS = +$("pause").value; $("pausev").textContent = PAUSE_MS;
   try { localStorage.setItem("pause_ms", PAUSE_MS); } catch (e) {}
@@ -724,7 +735,7 @@ function ckStop() { ckEpoch++; ckAudio.pause(); document.querySelectorAll(".ck-c
 async function ckPlay(clips, spans) {
   ckStop(); const me = ckEpoch;
   for (let i = 0; i < clips.length; i++) {
-    if (i > 0) { await new Promise(r => setTimeout(r, PAUSE_MS)); if (me !== ckEpoch) return; }  // the aizuchi slot
+    if (i > 0) { await new Promise(r => setTimeout(r, pauseAfter(clips[i - 1].text))); if (me !== ckEpoch) return; }  // the aizuchi slot
     spans[i].classList.add("on");
     ckAudio.src = "data:audio/wav;base64," + clips[i].audio;
     await new Promise(r => { ckAudio.onended = r; ckAudio.onerror = r; ckAudio.play().catch(r); });
@@ -734,7 +745,7 @@ async function ckPlay(clips, spans) {
 }
 $("ck-stop").onclick = ckStop;
 $("ck-run").onclick = async () => {
-  ckStop(); $("ck-run").disabled = true; $("ck-status").textContent = "generating…"; $("ck-pause").textContent = PAUSE_MS;
+  ckStop(); $("ck-run").disabled = true; $("ck-status").textContent = "generating…"; $("ck-pause").textContent = PAUSE_MS; $("ck-pause2").textContent = PAUSE_END_MS;
   try {
     const d = await (await api("/api/chunk_test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
       texts: $("ck-text").value.split("\n"), model: $("model").value, style: $("style").value, style_weight: +$("sw").value, length: +$("len").value, stretch_table: STRETCH_TABLE, stretch_jitter: STRETCH_JITTER }) })).json();
@@ -746,7 +757,7 @@ $("ck-run").onclick = async () => {
       box.innerHTML = [["sentence", "Sentence-level (old)"], ["phrase", "Phrase-level (new)"], ["phrase_q", "Phrase-level + final lengthening (per-ending factors)"]].map(([k, label]) => {
         const c = r[k], sp = c.reduce((a, x) => a + x.seconds, 0), gaps = Math.max(0, c.length - 1);
         return `<div style="margin:6px 0"><b>${label}</b> <button data-p="${ri}-${k}">▶ Play</button> ` +
-          `<small style="color:var(--muted)">${c.length} chunk(s), ${gaps} aizuchi slot(s), speech ${sp.toFixed(1)} s + pauses ${(gaps * (PAUSE_MS + 130) / 1000).toFixed(1)} s` +
+          `<small style="color:var(--muted)">${c.length} chunk(s), ${gaps} aizuchi slot(s), speech ${sp.toFixed(1)} s + pauses ${(c.slice(0, -1).reduce((a, x) => a + pauseAfter(x.text) + 130, 0) / 1000).toFixed(1)} s` +
           (k === "phrase_q" ? `, <b>${r.factors.length} of ${r.eligible}</b> eligible endings stretched` + (r.factors.length ? ` (×${Math.min(...r.factors).toFixed(2)}–×${Math.max(...r.factors).toFixed(2)})` : "") : "") + `</small><br>` +
           c.map((x, i) => `<span class="ck-chunk" data-i="${i}">${esc(x.text)}${x.factor ? ` ★×${x.factor}` : ""}</span>`).join('<span style="color:var(--muted)"> | </span>') + `</div>`;
       }).join("");

@@ -67,7 +67,10 @@ MODEL_ASSETS = SBV2_DIR / "model_assets"
 SYSTEM_PROMPT = """\
 あなたは「あおい」、25歳の女性です。
 あなたは自分の前の海外旅行での思い出について話しています。
-返事は1〜2文の短い話し言葉で答えてください。
+返事は話し言葉で、2〜3個の短い句をつなげて答えてください。
+句の終わりには必ず読点「、」を付け、「〜ね」「〜さ」「〜て」「〜けど」のどれかで終えてください。最後の句だけ「。」で終えます。
+最後の句も「〜ね。」「〜よね。」のように終え、まとめや締めくくりは言わず、続きがありそうな言い方にしてください。「〜な。」「〜だ。」では終えないでください。
+例：「駅前のカフェでね、朝ごはんを食べてたらさ、隣の人が話しかけてくれたんだよね。」
 質問を少なくし、自分のことも話してください。
 相手が話した言葉を繰り返さないようにしてください。
 """
@@ -268,7 +271,7 @@ STRETCH_LABELS = [  # (key, label, example): final = ends the sentence (。), mi
 ]
 STRETCH_JITTER = 0.1  # each stretched chunk gets its factor +- up to this much (variety within a conversation)
 PARTICLE_KEY = {"ね": "ne", "よ": "yo", "さ": "sa"}
-ENDING_RE = re.compile(r"(ね|よ|さ|けど|けれど|が|て)([。、]?)$")
+ENDING_RE = re.compile(r"(ね|よ|さ|けど|けれど|が|て)([。、！？!?]?)$")
 
 
 def classify_ending(text: str) -> str | None:
@@ -668,7 +671,7 @@ def trim_silence(wav: np.ndarray, sr: int, thr: float = 0.01, lead_ms: int = 30,
 
 # Final lengthening on the last particle of a chunk: the chunk is synthesized in ONE pass (so it stays continuous),
 # then the last TAIL_MS of the audio is time-stretched by TAIL_STRETCH (pitch kept) and cross-faded back in.
-TAIL_PARTICLE = re.compile(r"(ね|さ|よ|けど|けれど|が|て)[。、]?$")
+TAIL_PARTICLE = re.compile(r"(ね|さ|よ|けど|けれど|が|て)[。、！？!?]?$")
 TAIL_MS, TAIL_STRETCH, TAIL_FADE_MS = 200, 2.0, 20
 
 
