@@ -230,6 +230,15 @@
       <label style="flex-direction:row;align-items:center;gap:6px;color:var(--text);font-size:14px">
         <input id="dbg-filler-on" type="checkbox"> Filler backchannel on pauses
       </label>
+      <label style="flex-direction:row;align-items:center;gap:6px;color:var(--text);font-size:14px">
+        <input id="dbg-cont-on" type="checkbox" checked> AI continues the story when you stay silent
+      </label>
+      <label>Silence before it continues (s)
+        <input id="dbg-cont-at" type="number" min="2" max="30" step="0.5" value="5">
+      </label>
+      <label>Max continues in a row
+        <input id="dbg-cont-max" type="number" min="1" max="5" step="1" value="2">
+      </label>
     </section>
     <section class="card" data-dsub="live">
       <h2 style="font-size:14px;margin:0 0 8px">Decisions <small style="color:var(--muted)">(this browser)</small> <button id="dbg-clear" style="float:right;padding:2px 8px">Clear</button></h2>
@@ -327,7 +336,16 @@ function reportClip(completed) {
   const body = JSON.stringify({ id: c.id, start_s: c.start / rec.sr, end_s: rec.total / rec.sr, completed });
   rec.chain = rec.chain.then(() => fetch("/api/play_event", { method: "POST", headers: {"Content-Type": "application/json"}, body })).catch(() => {});
 }
-$("player").onplaying = () => { if (cur && cur.start == null) cur.start = rec.total; };  // audio really started
+$("player").onplaying = () => {
+  if (cur && cur.start == null) cur.start = rec.total;  // audio really started
+  if (cur && !cur.filler && turnEndAt != null) {         // first sound of the reply to a normal turn: how long after the turn was judged over?
+    const ms = Math.round(performance.now() - turnEndAt);
+    dbg(`reply latency ${(ms / 1000).toFixed(2)} s after the turn ended (+${END_AFTER}s silence wait)${earlyUsed ? " — early reply used" : " — no early reply"}`, "bc");
+    fetch("/api/latency", { method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ latency_ms: ms, silence_wait_s: END_AFTER, speech_s: +turnSpeech.toFixed(2), early_reply: earlyUsed }) }).catch(() => {});
+    turnEndAt = null;
+  }
+};
 // Silence between sentences = the page's pause + about 0.15 s left at the clip edges (the voice's own ~0.4 s padding is trimmed).
 let PAUSE_MS = 300, PAUSE_END_MS = 850, playEpoch = 0, lastPlayedText = "";  // aizuchi slots: after a phrase 300-500 ms, after a sentence longer (+~130 ms clip edges)
 try { const v = localStorage.getItem("pause_ms"); if (v !== null) PAUSE_MS = Math.min(500, Math.max(300, +v)); } catch (e) {}
@@ -376,13 +394,13 @@ function bargeIn() {
 }
 
 // ---------- streaming a reply (normal, or speculative while you pause) ----------
-function startStream(text, speculative) {
+function startStream(text, speculative, cont = false) {
   const s = { id: Math.random().toString(36).slice(2), text, speculative, committed: !speculative, ctrl: new AbortController(),
               held: [], bubble: null, got: false, texts: unanswered.slice(), firstAt: null, t0: performance.now() };
   s.promise = (async () => {
     const r = await api("/api/chat_stream", {
       method: "POST", headers: {"Content-Type": "application/json"}, signal: s.ctrl.signal,
-      body: JSON.stringify({ text, speculative, spec_id: s.id, llm: $("llm").value, test: $("dbg-test").checked, model: $("model").value,
+      body: JSON.stringify({ text, speculative, cont, spec_id: s.id, llm: $("llm").value, test: $("dbg-test").checked, model: $("model").value,
                              style: $("style").value, style_weight: +$("sw").value, length: +$("len").value, stretch_table: STRETCH_TABLE, stretch_jitter: STRETCH_JITTER }),
     });
     const reader = r.body.getReader(), dec = new TextDecoder();
@@ -408,6 +426,7 @@ function onStreamLine(s, line) {
   if (s.committed) deliver(s, msg); else s.held.push(msg);  // speculative: wait until your turn really ends
 }
 function deliver(s, { text, audio, id }) {
+  botSpoke = true;
   if (!s.got) { s.got = true; unanswered.splice(0, s.texts.length); }  // answered (at least partly)
   if (!s.bubble) { addMsg("bot", ""); s.bubble = $("log").lastChild; }
   s.bubble.textContent += text; $("log").scrollTop = $("log").scrollHeight;
@@ -422,17 +441,18 @@ function commitStream(s) {  // your turn ended: release what is already ready, t
   return n;
 }
 
-async function chatTurn() {
-  const text = unanswered.join("");
+async function chatTurn(cont = false) {
+  if (cont) turnEndAt = null;  // a silence-breaking turn has no turn end to measure from
+  const text = cont ? "" : unanswered.join("");
   let s;
-  if (spec && spec.stream && !spec.stream.ctrl.signal.aborted && spec.stream.text === text) {
+  if (!cont && spec && spec.stream && !spec.stream.ctrl.signal.aborted && spec.stream.text === text) {
     s = spec.stream; spec = null;
     const saved = s.firstAt ? s.firstAt - s.t0 : performance.now() - s.t0;
-    const n = commitStream(s);
+    const n = commitStream(s); earlyUsed = true;
     dbg(`turn ended → early reply used (${n} sentence(s) ready, saved ≈ ${(saved / 1000).toFixed(2)}s)`, "bc");
   } else {
-    cancelSpec();
-    s = startStream(text, false);
+    cancelSpec(); earlyUsed = false;
+    s = startStream(text, false, cont);
   }
   chatCtrl = s.ctrl;
   setStatus(s.got ? "Speaking…" : "Thinking…");
@@ -468,19 +488,24 @@ async function checkBarge(frames, sr, startSample) {
 // You paused: transcribe what you said so far (not logged) and start the reply early, held until the turn ends.
 async function startSpec(frames, sr) {
   const token = ++specSeq;
-  spec = { token, stream: null, specText: null };
+  const me = spec = { token, stream: null, specText: null, waited: false };
+  // `ready` settles when this attempt is over: with the early transcript once the LLM is started, or null if it was dropped.
+  // If your turn ends while the transcription is still running, the final transcription waits for this instead of the
+  // attempt being thrown away (that used to lose the early reply on long turns).
+  me.ready = new Promise(res => { me.settle = res; });
   dbg(`pause ≥ ${SPEC_AT}s → starting the reply early`, "bc");
-  let text;
+  let text, isBc;
   try {
     const fd = new FormData(); fd.append("audio", encodeWav(frames, sr), "spec.wav"); fd.append("kind", "user"); fd.append("log", "0");
-    ({ text } = await (await api("/api/asr", { method: "POST", body: fd })).json());
-  } catch (e) { if (token === specSeq) spec = null; return; }
-  if (token !== specSeq) return;                      // you spoke again, or the turn ended, meanwhile
-  if (!text || asrPending > 0) { spec = null; return; }
-  spec.specText = text;
-  spec.stream = startStream(unanswered.join("") + text, true);
-  spec.stream.promise.catch(() => {});                // aborts are expected
-  dbg(`early reply: ${JSON.stringify(text)} → LLM running`, "bc");
+    ({ text, backchannel: isBc } = await (await api("/api/asr", { method: "POST", body: fd })).json());
+  } catch (e) { if (token === specSeq) spec = null; me.settle(null); return; }
+  if (token !== specSeq) { me.settle(null); return; }   // you spoke again meanwhile
+  if (!text || isBc || asrPending > (me.waited ? 1 : 0)) { if (spec === me) spec = null; me.settle(null); return; }  // (when waited, that one pending item is this very turn)
+  me.specText = text;
+  me.stream = startStream(unanswered.join("") + text, true);
+  me.stream.promise.catch(() => {});                  // aborts are expected
+  dbg(`early reply: ${JSON.stringify(text)} → LLM running${me.waited ? " (turn had already ended)" : ""}`, "bc");
+  me.settle(text);
 }
 function cancelSpec() {
   specSeq++;
@@ -496,14 +521,18 @@ function cancelSpec() {
 
 // A finished utterance from the mic. Transcription runs strictly in order so text is never reordered or lost;
 // the bot answers once everything you said is transcribed and you've stopped talking.
-function handleUtterance(wav, backchannel = false, offset = null, knownText = null) {
+function handleUtterance(wav, backchannel = false, offset = null, knownText = null, specWait = null) {
   asrPending++;
-  asrQueue = asrQueue.then(() => transcribe(wav, backchannel, offset, knownText)).finally(() => { asrPending--; maybeAnswer(); });
+  asrQueue = asrQueue.then(() => transcribe(wav, backchannel, offset, knownText, specWait)).finally(() => { asrPending--; maybeAnswer(); });
 }
 
-async function transcribe(wav, backchannel, offset, knownText) {
+async function transcribe(wav, backchannel, offset, knownText, specWait = null) {
   if (!backchannel) setStatus("Transcribing…");
   try {
+    if (specWait) {  // the early transcription of this same speech was still running: use it (max 3 s), else transcribe normally
+      knownText = await Promise.race([specWait, new Promise(r => setTimeout(() => r(null), 3000))]);
+      dbg(knownText ? "waited for the early transcription → reused" : "early transcription failed → transcribing again", "bc");
+    }
     const fd = new FormData(); fd.append("audio", wav, "utt.wav"); fd.append("kind", backchannel ? "backchannel" : "user");
     if (offset != null) fd.append("offset", offset);
     if (knownText != null) fd.append("known_text", knownText);  // already transcribed while you paused: skip the model
@@ -551,6 +580,21 @@ let lastSpec = 0, specSeq = 0, spec = null;  // spec = { token, stream, specText
 let FILLER_ON = false, FILLER_AT = 0.8;
 const FILLERS = ["うん。", "うんうん。", "うん、うん。"], FILLER_MIN_SPEECH = 0.6, FILLER_COOLDOWN = 4000;
 let lastFiller = 0, epoch = 0;
+// Silence breaking: when the bot has finished and you stay silent this long, it carries on with its story (an LLM turn
+// with no user message). At most CONT_MAX times in a row; anything you say resets the count.
+let turnEndAt = null, turnSpeech = 0, earlyUsed = false;  // end-to-end latency of the last normal turn
+let CONT_ON = true, CONT_AFTER = 5, CONT_MAX = 2, contCount = 0, botSpoke = false, silentSince = null;
+function silenceTick() {
+  const busy = !listening || chatCtrl || playing || queue.length || asrPending > 0 || vad.state === "speech" || unanswered.length || spec || !botSpoke;
+  if (busy) { silentSince = null; return; }
+  if (silentSince == null) { silentSince = Date.now(); return; }  // the clock starts when everything went quiet
+  if (CONT_ON && contCount < CONT_MAX && Date.now() - silentSince >= CONT_AFTER * 1000) {
+    silentSince = null; contCount++;
+    dbg(`you were silent ${CONT_AFTER}s → the AI continues the story (${contCount}/${CONT_MAX})`, "bc");
+    chatTurn(true);
+  }
+}
+setInterval(silenceTick, 250);
 const BARGE_MAX = 5;  // continuous speech over the bot this long always interrupts, whatever it sounds like
 let BARGE_AFTER = 1.0;  // while the bot is talking, only speech longer than this interrupts it; shorter = backchannel
 let listening = false, micCtx = null, micStream = null;
@@ -636,9 +680,14 @@ function onFrame(f) {
     Object.assign(vad, { state: "idle", utt: [], uttT: 0, loud: 0, quiet: 0, overBot: false, fillerSent: false, specSent: false });
     // An early reply for exactly this speech can be reused (its transcript too); one still transcribing is dropped.
     const specText = spec && spec.stream ? spec.specText : null;
-    if (spec && !spec.stream) { specSeq++; spec = null; }
+    let specWait = null;
+    if (spec && !spec.stream) {
+      if (backchannel || speech < MIN_SPEECH) { specSeq++; spec = null; }
+      else { spec.waited = true; specWait = spec.ready; dbg("turn ended while the early transcription is still running → waiting for it", "bc"); }
+    }
+    if (!backchannel && speech >= MIN_SPEECH) { turnEndAt = performance.now(); turnSpeech = speech; }
     if (backchannel) handleUtterance(encodeWav(frames, sr), true, offset);
-    else if (speech >= MIN_SPEECH) handleUtterance(encodeWav(frames, sr), false, offset, specText);
+    else if (speech >= MIN_SPEECH) handleUtterance(encodeWav(frames, sr), false, offset, specText, specWait);
     else maybeAnswer();  // too short: noise
   }
 }
@@ -952,6 +1001,9 @@ $("dbg-spec-at").onchange = () => SPEC_AT = +$("dbg-spec-at").value;
 $("dbg-spec-on").onchange = () => SPEC_ON = $("dbg-spec-on").checked;
 $("dbg-filler-at").onchange = () => FILLER_AT = +$("dbg-filler-at").value;
 $("dbg-filler-on").onchange = () => FILLER_ON = $("dbg-filler-on").checked;
+$("dbg-cont-on").onchange = () => CONT_ON = $("dbg-cont-on").checked;
+$("dbg-cont-at").onchange = () => CONT_AFTER = +$("dbg-cont-at").value;
+$("dbg-cont-max").onchange = () => CONT_MAX = +$("dbg-cont-max").value;
 
 // Debug sub-tabs: one group of tools at a time instead of one long page.
 function showDebugGroup(g) {
@@ -1002,6 +1054,7 @@ $("reset").onclick = async () => {
   bargeIn(); unanswered = [];
   flushRec(); await rec.chain;  // finish the old session's recording first
   await api("/api/reset", { method: "POST" });
+  botSpoke = false; contCount = 0; silentSince = null;
   Object.assign(rec, { buf: [], n: 0, total: 0, start: true });  // new session = new full recording $("log").innerHTML = ""; setStatus("Chat reset.");
 };
 

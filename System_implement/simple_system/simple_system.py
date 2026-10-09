@@ -1024,7 +1024,12 @@ def api_llm_bench(reps: int = 3):
 SPEAKABLE = re.compile(r"[^\W_]")  # at least one letter/kana/kanji/digit
 
 
+# Sent to the LLM instead of a user message when the user has been silent for a while and the AI should break the silence.
+CONTINUE_PROMPT = "（相手は黙っています。気まずくならないように、今の話の続きや、関連する思い出を、自分から話してください。）"
+
+
 class StreamRequest(TTSRequest):
+    cont: bool = False  # silence-breaking turn: `text` is ignored, CONTINUE_PROMPT is used and no user line is logged
     speculative: bool = False  # reply generated while you pause: nothing is logged/kept unless /api/spec/commit follows
     spec_id: str = ""
     llm: str = ""  # "gemini" | "gemma" (empty = default)
@@ -1085,6 +1090,22 @@ def api_spec_cancel(id: str):
     return {"ok": True}
 
 
+class LatencyEvent(BaseModel):
+    latency_ms: int
+    silence_wait_s: float
+    speech_s: float
+    early_reply: bool
+
+
+@app.post("/api/latency")
+def api_latency(ev: LatencyEvent):
+    """The page measured how long after the turn was judged over the first sound of the reply started."""
+    log_chat("event", "reply latency", latency_ms=ev.latency_ms, silence_wait_s=ev.silence_wait_s,
+             speech_s=ev.speech_s, early_reply=ev.early_reply,
+             from_last_word_s=round(ev.latency_ms / 1000 + ev.silence_wait_s, 2))
+    return {"ok": True}
+
+
 @app.post("/api/interrupt")
 def api_interrupt():
     """Barge-in: tell the running reply to stop."""
@@ -1100,7 +1121,7 @@ def api_chat_stream(req: StreamRequest):
     Response is NDJSON: {"text": sentence, "audio": base64 wav} per line.
     Stops early if a newer request or /api/interrupt arrives; only the sentences already sent
     are kept in the history (and nothing is kept if none were sent)."""
-    if not req.text.strip() and not req.test:
+    if not req.text.strip() and not req.test and not req.cont:
         raise HTTPException(400, "Empty text")
     spec = None
     if req.speculative:
@@ -1116,8 +1137,11 @@ def api_chat_stream(req: StreamRequest):
 
         cancelled = lambda: my_turn != turn_no
         t0 = time.perf_counter()
-        user = turn("user", req.text.strip())
+        user = turn("user", CONTINUE_PROMPT if req.cont else req.text.strip())
+        if req.cont:
+            log_chat("event", "silence: AI continues the story", turn=my_turn)
         spoken, buf, first = [], "", True
+        timing = {}  # seconds since this stream started: first LLM text, first spoken sentence, end
 
         def problem(msg, **extra):  # failures are recorded in the chat log (not only the console) so they can be found later
             print(f"[problem] {msg}", flush=True)
@@ -1136,12 +1160,15 @@ def api_chat_stream(req: StreamRequest):
                 problem(f"TTS failed, sentence skipped: {e!r}", sentence=sentence)
                 return None
             log_time("TTS", t1, f"-> {sentence!r} (since start {time.perf_counter() - t0:.2f}s)")
+            if "first_clip_s" not in timing and not fallback:
+                timing["first_clip_s"] = round(time.perf_counter() - t0, 2)
+                timing["first_tts_s"] = round(time.perf_counter() - t1, 2)
             if not fallback:
                 spoken.append(sentence)
             with spec_lock:  # while speculative and not committed, logging is parked; commit flushes it
                 hold = spec["hold"] if spec and not spec["committed"] else None
                 clip_id = log_audio("ai", audio, hold=hold)
-                log_chat("ai", sentence, clip_id, hold=hold, turn=my_turn, stretch_kind=d[0] if d else None, stretch_factor=d[1] if d else None, **({"fallback": True} if fallback else {}))
+                log_chat("ai", sentence, clip_id, hold=hold, turn=my_turn, stretch_kind=d[0] if d else None, stretch_factor=d[1] if d else None, **({"continued": True} if req.cont else {}), **({"fallback": True} if fallback else {}))
             return json.dumps({"text": sentence, "audio": base64.b64encode(audio).decode(), "id": clip_id}) + "\n"
 
         def llm_chunks():
@@ -1184,6 +1211,7 @@ def api_chat_stream(req: StreamRequest):
                     return
                 if first:
                     log_time("LLM first chunk", t0)
+                    timing["llm_first_s"] = round(time.perf_counter() - t0, 2)
                     first = False
                 buf += chunk.text
                 while (m := SENTENCE_END.match(buf)):
@@ -1199,6 +1227,7 @@ def api_chat_stream(req: StreamRequest):
                 if (line := speak(FALLBACK_REPLY, fallback=True)) and not cancelled():
                     yield line
             log_time("LLM+TTS total", t0)
+            timing["total_s"] = round(time.perf_counter() - t0, 2)
         finally:
             with spec_lock:
                 # A speculative reply that finished before your turn ended just waits: commit/cancel decides its fate.
@@ -1221,6 +1250,9 @@ def api_chat_stream(req: StreamRequest):
                     log_chat("event", "interrupted", sentences_sent=len(spoken), turn=my_turn)
                 if spoken and not req.test:
                     history.extend([user, turn("assistant", "".join(spoken))])
+            if timing and not cancelled():
+                log_chat("event", "turn timing", turn=my_turn, speculative=req.speculative, cont=req.cont,
+                         user_chars=len(req.text), sentences=len(spoken), **timing)
             done.set()
 
     return StreamingResponse(events(), media_type="application/x-ndjson")
