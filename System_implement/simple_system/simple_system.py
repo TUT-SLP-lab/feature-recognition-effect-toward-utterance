@@ -1,5 +1,5 @@
 """
-Simple cascaded voice chat: mic -> Kotoba-Whisper (ASR) -> Gemini 3.5 Flash Lite/Genma 4 12B (LLM) -> Style-Bert-VITS2 (TTS).
+Simple cascaded voice chat: mic -> anime-whisper (ASR) -> Gemini 3.5 Flash Lite/Genma 4 12B (LLM) -> Style-Bert-VITS2 (TTS).
 
 Run:  GENAI_API_KEY=... python simple_system.py   (then open http://localhost:8000)
 LLMs: Gemini 3.5 Flash-Lite (needs GENAI_API_KEY) and local Gemma 4 12B (QAT 4-bit, served by llama.cpp); pick one in the web UI
@@ -50,7 +50,9 @@ from style_bert_vits2.nlp import bert_models  # noqa: E402
 from style_bert_vits2.tts_model import TTSModel  # noqa: E402
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-ASR_MODEL = "kotoba-tech/kotoba-whisper-v2.0"
+ASR_MODEL = "litagin/anime-whisper"  # was kotoba-tech/kotoba-whisper-v2.0 (swap back here and in ASR_KWARGS)
+# anime-whisper's model card: no initial prompt, and no repetition limits (they cut off short repeated words like うんうん)
+ASR_KWARGS = {"language": "ja", "task": "transcribe", "no_repeat_ngram_size": 0, "repetition_penalty": 1.0}
 GEMINI_MODEL = "gemini-3.5-flash-lite"
 GEMMA_MODEL = "google/gemma-4-12B-it-qat-q4_0-gguf"  # official quantization-aware-trained 4-bit GGUF (llama.cpp)
 GEMMA_FILE = "gemma-4-12b-it-qat-q4_0.gguf"
@@ -77,7 +79,7 @@ SYSTEM_PROMPT = """\
 
 # ---------------- load models once at startup ----------------
 asr = pipeline(
-    "automatic-speech-recognition", model=ASR_MODEL, device=DEVICE, chunk_length_s=15,
+    "automatic-speech-recognition", model=ASR_MODEL, device=DEVICE, chunk_length_s=30,
     dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
 )
 
@@ -446,8 +448,7 @@ def warmup():
             print(f"[warmup] {name} skipped: {e!r}", flush=True)
 
     def asr_step():
-        asr({"raw": np.zeros(16000, dtype=np.float32), "sampling_rate": 16000},
-            generate_kwargs={"language": "ja", "task": "transcribe"})
+        asr({"raw": np.zeros(16000, dtype=np.float32), "sampling_rate": 16000}, generate_kwargs=ASR_KWARGS)
 
     def tts_step():
         model_id = os.environ.get("TTS_MODEL") or list_tts_models()[0]["id"]
@@ -573,6 +574,17 @@ def api_play_event(ev: PlayEvent):
     return {"ok": True}
 
 
+# A clip whose transcript is only an ellipsis / punctuation, or only aizuchi words, is an aizuchi, not a turn: the page must not answer it.
+BACKCHANNEL_WORDS = re.compile(r"(?:う+ん+|ん+|ふ+ん+|は+い+|え+え*|へ+え+|あ+|お+|そう|なるほど)+")
+
+
+def is_backchannel_text(text: str, seconds: float) -> bool:
+    t = re.sub(r"[\s…。、，．,.！？!?・〜~ー]", "", text)  # (ー removed so うーん = うん)
+    if t and re.search(r"[?？]", text):  # "え？" is a request to repeat, not an aizuchi
+        return False
+    return t == "" or (seconds <= 4 and bool(BACKCHANNEL_WORDS.fullmatch(t)))
+
+
 @app.post("/api/asr")
 def api_asr(audio: UploadFile = File(...), kind: str = Form("user"), offset: float | None = Form(None),
             log: int = Form(1), known_text: str | None = Form(None)):
@@ -583,21 +595,30 @@ def api_asr(audio: UploadFile = File(...), kind: str = Form("user"), offset: flo
     samples = decode_audio(raw)
     if len(samples) < 1600:  # < 0.1 s
         return {"text": ""}
+    asr_ms = None
     if known_text is not None:
         text = known_text.strip()
     else:
-        result = asr({"raw": samples, "sampling_rate": 16000}, generate_kwargs={"language": "ja", "task": "transcribe"})
+        t_asr = time.perf_counter()
+        result = asr({"raw": samples, "sampling_rate": 16000}, generate_kwargs=ASR_KWARGS)
         text = result["text"].strip()
+        asr_ms = round((time.perf_counter() - t_asr) * 1000)
     log_time("ASR", t0, f"(audio {len(samples) / 16000:.1f}s{', reused speculative text' if known_text is not None else ''}"
                         f"{'' if log else ', speculative'}) -> {text!r}")
+    kind = kind if kind in ("user", "backchannel") else "user"
+    reclassified = kind == "user" and bool(text) and is_backchannel_text(text, len(samples) / 16000)
+    if reclassified:
+        kind = "backchannel"
     if text and log:
         with log_lock:
             full = mic_rec["rel"]
-        log_chat(kind if kind in ("user", "backchannel") else "user", text, log_audio("human", raw),
+        log_chat(kind, text, log_audio("human", raw), **({"reclassified": True} if reclassified else {}),
                  full_audio=full if offset is not None else None,
                  full_offset_s=round(offset, 3) if offset is not None and full else None,
-                 duration_s=round(len(samples) / 16000, 3))
-    return {"text": text}
+                 duration_s=round(len(samples) / 16000, 3), asr_ms=asr_ms, asr_reused=known_text is not None)
+    elif text and not log:  # speculative transcription: not a chat line, but its cost is worth keeping
+        log_chat("event", "speculative ASR", asr_ms=asr_ms, audio_s=round(len(samples) / 16000, 2))
+    return {"text": text, "backchannel": kind == "backchannel"}
 
 
 @app.get("/api/debug/log")
@@ -614,6 +635,121 @@ def api_debug_log():
             except ValueError:
                 pass  # half-written last line
     return {"session": f"{d.parent.name}/{d.name}", "pending_writes": log_q.qsize(), "entries": entries}
+
+
+# ---------------- ASR comparison (Debug tab) ----------------
+# Candidate models are loaded on first use and kept; "anime" is the one the chat already runs (ASR_MODEL).
+ASR_CANDIDATES = {
+    "kotoba": ("kotoba-tech/kotoba-whisper-v2.0", {}),
+    "anime": ("litagin/anime-whisper", {"no_repeat_ngram_size": 0, "repetition_penalty": 1.0}),  # per its model card: no initial prompt
+    "turbo": ("openai/whisper-large-v3-turbo", {}),
+}
+_asr_models: dict[str, object] = {"anime": asr}
+_asr_lock = threading.Lock()
+
+
+def get_asr(key: str):
+    """A candidate key, or any 'org/name' Hugging Face id (Whisper-style, loaded with the plain transformers pipeline)."""
+    with _asr_lock:
+        if key not in _asr_models:
+            if key in ASR_CANDIDATES:
+                model_id = ASR_CANDIDATES[key][0]
+            elif re.fullmatch(r"[\w.-]+/[\w.-]+", key):
+                model_id = key
+            else:
+                raise HTTPException(400, f"unknown ASR model {key!r}")
+            print(f"[asr-compare] loading {model_id} ...", flush=True)
+            pipe = pipeline("automatic-speech-recognition", model=model_id, device=DEVICE, chunk_length_s=15,
+                            dtype=torch.float16 if DEVICE == "cuda" else torch.float32)
+            try:  # one throwaway run so the first timed transcription is not slowed by GPU warm-up
+                pipe({"raw": np.zeros(16000, dtype=np.float32), "sampling_rate": 16000}, generate_kwargs={"language": "ja", "task": "transcribe"})
+            except Exception:
+                pass
+            _asr_models[key] = pipe
+        return _asr_models[key]
+
+
+def run_asr_models(samples: np.ndarray, loaded: dict) -> dict:
+    """Transcribe one clip with every loaded model; ms is the transcription time only (the model is already loaded)."""
+    results = {}
+    for m, pipe in loaded.items():
+        kw = {"language": "ja", "task": "transcribe", **(ASR_CANDIDATES.get(m, ("", {}))[1])}
+        t = time.perf_counter()
+        try:
+            text = pipe({"raw": samples, "sampling_rate": 16000}, generate_kwargs=kw)["text"].strip()
+        except Exception as e:
+            text = f"[error: {e!r}]"
+        results[m] = {"text": text, "ms": round((time.perf_counter() - t) * 1000)}
+    return results
+
+
+@app.get("/api/asr_models")
+def api_asr_models():
+    return [{"key": k, "id": v[0], "loaded": k in _asr_models} for k, v in ASR_CANDIDATES.items()]
+
+
+@app.get("/api/asr_clips")
+def api_asr_clips(role: str = "backchannel", max_s: float = 3.0, limit: int = 200):
+    """Saved human clips from every session's log (newest first), with the text the chat's ASR gave them."""
+    out = []
+    for f in sorted(LOG_ROOT.glob("**/chatlog.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            for line in f.read_text(encoding="utf-8").splitlines():
+                r = json.loads(line) if line.strip() else {}
+                if r.get("role") != role or not r.get("audio") or (r.get("duration_s") or 0) > max_s:
+                    continue
+                rel = (f.parent / r["audio"]).relative_to(LOG_ROOT).as_posix()
+                out.append({"rel": rel, "text": r.get("text", ""), "seconds": r.get("duration_s"),
+                            "session": f.parent.name})
+        except Exception:
+            continue
+        if len(out) >= limit:
+            break
+    return out[:limit]
+
+
+@app.get("/api/asr_clip_audio/{rel:path}")
+def api_asr_clip_audio(rel: str):
+    base = LOG_ROOT.resolve()
+    path = (base / rel).resolve()
+    if base not in path.parents or not path.is_file() or path.suffix != ".wav":
+        raise HTTPException(404)
+    return FileResponse(path, media_type="audio/wav")
+
+
+@app.post("/api/asr_compare_upload")
+def api_asr_compare_upload(audio: UploadFile = File(...), models: str = Form(...)):
+    """Live test: a fresh mic recording (any browser format) run through the chosen models."""
+    samples = decode_audio(audio.file.read())
+    keys = [m for m in models.split(",") if m.strip()]
+    loaded = {m: get_asr(m.strip()) for m in keys}
+    return {"seconds": len(samples) / 16000, "results": run_asr_models(samples, loaded)}
+
+
+class AsrCompareRequest(BaseModel):
+    clips: list[str]  # paths relative to LOG_ROOT, as listed by /api/asr_clips
+    models: list[str]
+
+
+@app.post("/api/asr_compare")
+def api_asr_compare(req: AsrCompareRequest):
+    base = LOG_ROOT.resolve()
+    loaded = {}
+    for m in req.models:
+        t = time.perf_counter()
+        loaded[m] = get_asr(m)
+        if time.perf_counter() - t > 1:
+            print(f"[asr-compare] {m} ready in {time.perf_counter() - t:.1f}s", flush=True)
+    out = []
+    for rel in req.clips:
+        path = (base / rel).resolve()
+        if base not in path.parents or not path.is_file():
+            out.append({"rel": rel, "error": "not found"})
+            continue
+        samples = decode_audio(path.read_bytes())
+        row = {"rel": rel, "seconds": len(samples) / 16000, "results": run_asr_models(samples, loaded)}
+        out.append(row)
+    return {"results": out}
 
 
 @app.get("/api/debug/audio/{rel:path}")

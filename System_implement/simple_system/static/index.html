@@ -63,7 +63,7 @@
 </head>
 <body>
 <main>
-  <h1>Voice Chat — Kotoba-Whisper → LLM → Style-Bert-VITS2</h1>
+  <h1>Voice Chat — anime-whisper → LLM → Style-Bert-VITS2</h1>
 
   <div class="tabs">
     <button id="tab-chat" class="active">Chat</button>
@@ -113,11 +113,40 @@
       <button data-d="live">Live &amp; decisions</button>
       <button data-d="cues">Aizuchi cues</button>
       <button data-d="bc">Backchannel test &amp; log</button>
+      <button data-d="asr">ASR comparison</button>
       <button data-d="llm">LLM benchmark</button>
     </div>
     <section class="card" data-dsub="live">
       <h2 style="font-size:14px;margin:0 0 8px">Live state <small style="color:var(--muted)">— speak a short “うん” while the AI is talking to test backchannel</small></h2>
       <div class="kv" id="live"></div>
+    </section>
+    <section class="card" data-dsub="asr">
+      <h2 style="font-size:14px;margin:0 0 8px">ASR comparison <small style="color:var(--muted)">— run several Japanese ASR models on your saved clips</small></h2>
+      <div class="row" style="align-items:end">
+        <label>Clips from the logs
+          <select id="asr-role"><option value="backchannel">backchannel (aizuchi)</option><option value="user">user turns</option></select>
+        </label>
+        <label>Max length (s) <input id="asr-max" type="number" min="0.3" max="60" step="0.5" value="3" style="width:80px"></label>
+        <button id="asr-load">Load clips</button>
+        <span id="asr-count" style="color:var(--muted);font-size:13px"></span>
+      </div>
+      <div class="row" id="asr-models" style="margin-top:8px;align-items:center"></div>
+      <div class="row" style="margin-top:6px;align-items:center">
+        <label>Other model (Hugging Face id, Whisper-style) <input id="asr-extra" placeholder="org/name" style="width:240px"></label>
+        <button id="asr-run" class="primary">▶ Run on checked clips</button>
+        <span id="asr-status" style="color:var(--muted);font-size:13px"></span>
+      </div>
+      <div style="color:var(--muted);font-size:12px;margin:6px 0">The first run of a model downloads and loads it (can take a minute or more), and it shares the GPU with the chat. “Truth” is yours to type: leave it empty for a clip with no real speech, and any text a model returns counts as a hallucination. Truths are saved in this browser. Scores are character error rate (punctuation and spaces ignored); lower is better.</div>
+      <h3 style="font-size:13px;margin:14px 0 6px">Live mic test</h3>
+      <div class="row" style="align-items:center">
+        <button id="am-rec" class="primary">● Record</button>
+        <span id="am-status" style="color:var(--muted);font-size:13px">Uses the models checked above. Speak, then press Stop: every model transcribes the same recording.</span>
+      </div>
+      <div id="am-summary" style="margin:6px 0"></div>
+      <table class="tbl"><thead id="am-head"></thead><tbody id="am-rows"></tbody></table>
+      <h3 style="font-size:13px;margin:14px 0 6px">Saved clips</h3>
+      <div id="asr-summary" style="margin:6px 0"></div>
+      <table class="tbl"><thead id="asr-head"></thead><tbody id="asr-rows"></tbody></table>
     </section>
     <section class="card" data-dsub="llm">
       <h2 style="font-size:14px;margin:0 0 8px">LLM latency benchmark <small style="color:var(--muted)">— same prompts on every available LLM</small></h2>
@@ -423,6 +452,19 @@ async function chatTurn() {
   }
 }
 
+// Speech over the bot reached BARGE_AFTER: interrupt only if it is a real word, not a long aizuchi / hum.
+async function checkBarge(frames, sr, startSample) {
+  let isBc = false;
+  try {
+    const fd = new FormData(); fd.append("audio", encodeWav(frames, sr), "bargecheck.wav"); fd.append("kind", "user"); fd.append("log", "0");
+    const r = await (await api("/api/asr", { method: "POST", body: fd })).json();
+    isBc = !!r.backchannel; dbg(`barge check: ${JSON.stringify(r.text)} → ${isBc ? "aizuchi, not an interruption" : "real speech"}`, isBc ? "bc" : "warn");
+  } catch (e) { dbg("barge check failed → treating as an interruption", "warn"); }
+  if (vad.state !== "speech" || vad.startSample !== startSample || !vad.overBot) return;  // that speech has ended or changed meanwhile
+  if (isBc) { vad.bargeAt = vad.uttT - vad.quiet + 1.0; vad.bargeChecking = false; return; }  // look again after another second
+  vad.overBot = false; bargeIn(); setStatus("Listening to you…");
+}
+
 // You paused: transcribe what you said so far (not logged) and start the reply early, held until the turn ends.
 async function startSpec(frames, sr) {
   const token = ++specSeq;
@@ -465,10 +507,11 @@ async function transcribe(wav, backchannel, offset, knownText) {
     const fd = new FormData(); fd.append("audio", wav, "utt.wav"); fd.append("kind", backchannel ? "backchannel" : "user");
     if (offset != null) fd.append("offset", offset);
     if (knownText != null) fd.append("known_text", knownText);  // already transcribed while you paused: skip the model
-    const { text } = await (await api("/api/asr", { method: "POST", body: fd })).json();
-    dbg(`ASR (${backchannel ? "backchannel" : "user"}): ${text ? JSON.stringify(text) : "empty — not logged"}`, backchannel ? "bc" : "");
-    if (text && backchannel) addMsg("backchannel", text);   // shown only; doesn't trigger a reply
-    else if (text) { addMsg("user", text); unanswered.push(text); }
+    const { text, backchannel: isBc } = await (await api("/api/asr", { method: "POST", body: fd })).json();
+    const asBc = backchannel || isBc;  // isBc: the transcript is only "…" or aizuchi words, so it is not a turn to answer
+    dbg(`ASR (${backchannel ? "backchannel" : isBc ? "user → reclassified as backchannel" : "user"}): ${text ? JSON.stringify(text) : "empty — not logged"}`, asBc ? "bc" : "");
+    if (text && asBc) addMsg("backchannel", text);   // shown only; doesn't trigger a reply
+    else if (text) { addMsg("user", text); unanswered.push(text); contCount = 0; }
   } catch (e) { setStatus("Error: " + e.message); }
 }
 
@@ -508,6 +551,7 @@ let lastSpec = 0, specSeq = 0, spec = null;  // spec = { token, stream, specText
 let FILLER_ON = false, FILLER_AT = 0.8;
 const FILLERS = ["うん。", "うんうん。", "うん、うん。"], FILLER_MIN_SPEECH = 0.6, FILLER_COOLDOWN = 4000;
 let lastFiller = 0, epoch = 0;
+const BARGE_MAX = 5;  // continuous speech over the bot this long always interrupts, whatever it sounds like
 let BARGE_AFTER = 1.0;  // while the bot is talking, only speech longer than this interrupts it; shorter = backchannel
 let listening = false, micCtx = null, micStream = null;
 const vad = { state: "idle", pre: [], preT: 0, utt: [], uttT: 0, loud: 0, quiet: 0, overBot: false };
@@ -552,7 +596,7 @@ function onFrame(f) {
     if (vad.loud >= START_AFTER) {
       vad.state = "speech"; vad.utt = vad.pre.slice(); vad.uttT = vad.preT; vad.quiet = 0;
       vad.pre = []; vad.preT = 0;
-      vad.fillerSent = false; vad.specSent = false;
+      vad.fillerSent = false; vad.specSent = false; vad.bargeAt = BARGE_AFTER; vad.bargeChecking = false;
       vad.startSample = rec.total - vad.utt.reduce((a, x) => a + x.length, 0);  // where this utterance starts in the full recording
       vad.overBot = !!chatCtrl;              // bot is generating / speaking: don't interrupt yet
       dbg(`speech start — bot ${vad.overBot ? "BUSY → holding (possible backchannel)" : "idle → normal turn"}`);
@@ -573,9 +617,15 @@ function onFrame(f) {
       && vad.uttT - vad.quiet >= FILLER_MIN_SPEECH && Date.now() - lastFiller > FILLER_COOLDOWN) {
     vad.fillerSent = true; lastFiller = Date.now(); fillerBackchannel();
   }
-  if (vad.overBot && vad.uttT - vad.quiet >= BARGE_AFTER) {   // not a backchannel: real interruption
-    dbg(`speech ≥ ${BARGE_AFTER}s while bot busy → INTERRUPT`, "warn");
-    vad.overBot = false; bargeIn(); setStatus("Listening to you…");
+  if (vad.overBot && vad.uttT - vad.quiet >= vad.bargeAt) {
+    // Long enough to be a real interruption — unless it is only a long "んー" / "うんうん": the speech so far is
+    // transcribed first (the bot keeps talking meanwhile) and only a real word interrupts. Past BARGE_MAX it always interrupts.
+    if (vad.uttT - vad.quiet >= BARGE_MAX) {
+      dbg(`speech ≥ ${BARGE_MAX}s while bot busy → INTERRUPT`, "warn");
+      vad.overBot = false; bargeIn(); setStatus("Listening to you…");
+    } else if (!vad.bargeChecking) {
+      vad.bargeChecking = true; checkBarge(vad.utt.slice(), micCtx.sampleRate, vad.startSample);
+    }
   }
   if (vad.quiet >= END_AFTER || vad.uttT >= MAX_UTT) {
     const speech = vad.uttT - vad.quiet, frames = vad.utt, sr = micCtx.sampleRate, offset = vad.startSample / sr;
@@ -687,6 +737,125 @@ $("bench-run").onclick = async () => {
   } catch (e) { $("bench-status").textContent = "failed: " + e.message; }
   finally { $("bench-run").disabled = false; }
 };
+// ---------- ASR comparison ----------
+const asrState = { clips: [], models: [], results: {} };  // results[rel][model] = { text, ms }
+const asrNorm = s => String(s || "").replace(/[\s。、，．,.！？!?「」『』（）()…〜~・]/g, "");
+function asrCer(truth, hyp) {  // character error rate on normalized text
+  const a = [...asrNorm(truth)], b = [...asrNorm(hyp)];
+  if (!a.length) return b.length ? 1 : 0;
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    prev = cur;
+  }
+  return prev[b.length] / a.length;
+}
+const asrTruth = rel => { try { return JSON.parse(localStorage.getItem("asr_truth") || "{}")[rel]; } catch (e) { return undefined; } };
+function asrSetTruth(rel, v) { try { const t = JSON.parse(localStorage.getItem("asr_truth") || "{}"); if (v === null) delete t[rel]; else t[rel] = v; localStorage.setItem("asr_truth", JSON.stringify(t)); } catch (e) {} }
+const asrEsc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+function asrRender() {
+  const ms = asrState.models;
+  $("asr-head").innerHTML = `<tr><th></th><th align="left">Clip</th><th>Chat ASR said</th><th>Truth</th>${ms.map(m => `<th>${asrEsc(m)}</th>`).join("")}</tr>`;
+  $("asr-rows").innerHTML = asrState.clips.map((c, i) => {
+    const tr = asrTruth(c.rel), res = asrState.results[c.rel] || {};
+    return `<tr><td><input type="checkbox" data-i="${i}" checked></td>` +
+      `<td><audio controls preload="none" src="/api/asr_clip_audio/${c.rel}" style="height:28px;width:200px"></audio><br><small style="color:var(--muted)">${c.seconds ?? "?"} s · ${asrEsc(c.session)}</small></td>` +
+      `<td>${asrEsc(c.text)}</td><td><input data-t="${i}" value="${asrEsc(tr ?? "")}" placeholder="(type, or ∅ = no speech)" style="width:150px"> <button data-n="${i}" title="No real speech: any output is a hallucination">∅</button></td>` +
+      ms.map(m => { const r = res[m]; if (!r) return "<td></td>"; const cer = tr === undefined ? null : asrCer(tr, r.text);
+        return `<td>${r.text ? asrEsc(r.text) : "<small style='color:var(--muted)'>(empty)</small>"}<br><small style="color:var(--muted)">${r.ms} ms${cer == null ? "" : ` · CER ${(cer * 100).toFixed(0)}%`}</small></td>`; }).join("") + "</tr>";
+  }).join("");
+  $("asr-rows").querySelectorAll("input[data-t]").forEach(el => el.onchange = () => { const c = asrState.clips[+el.dataset.t]; asrSetTruth(c.rel, el.value.trim() === "" ? null : el.value); asrRender(); });
+  $("asr-rows").querySelectorAll("button[data-n]").forEach(el => el.onclick = () => { asrSetTruth(asrState.clips[+el.dataset.n].rel, ""); asrRender(); });
+  // summary: mean CER on clips with a truth, and hallucinations on clips marked as no speech
+  $("asr-summary").innerHTML = ms.length ? "<table class='tbl'><tr><th align='left'>Model</th><th>Labeled clips</th><th>Mean CER</th><th>Hallucinated on no-speech</th><th>Median ms</th></tr>" + ms.map(m => {
+    const rows = asrState.clips.filter(c => asrState.results[c.rel]?.[m] && asrTruth(c.rel) !== undefined);
+    const sp = rows.filter(c => asrNorm(asrTruth(c.rel)) !== ""), ns = rows.filter(c => asrNorm(asrTruth(c.rel)) === "");
+    const cer = sp.length ? sp.reduce((a, c) => a + asrCer(asrTruth(c.rel), asrState.results[c.rel][m].text), 0) / sp.length : null;
+    const hall = ns.filter(c => asrNorm(asrState.results[c.rel][m].text) !== "").length;
+    const t = asrState.clips.map(c => asrState.results[c.rel]?.[m]?.ms).filter(x => x != null).sort((a, b) => a - b);
+    return `<tr><td>${asrEsc(m)}</td><td align="right">${sp.length}+${ns.length} no-speech</td><td align="right">${cer == null ? "–" : (cer * 100).toFixed(1) + "%"}</td><td align="right">${ns.length ? hall + " / " + ns.length : "–"}</td><td align="right">${t.length ? t[t.length >> 1] : "–"}</td></tr>`;
+  }).join("") + "</table>" : "";
+}
+async function asrInit() {
+  const list = await (await api("/api/asr_models")).json();
+  const had = [...document.querySelectorAll("#asr-models input")].map(e => [e.dataset.m, e.checked]);
+  const on = k => had.length ? !!(had.find(x => x[0] === k) || [0, false])[1] : (k === "kotoba" || k === "anime");  // keep your choice on re-render
+  $("asr-models").innerHTML = list.map(m => `<label style="flex-direction:row;align-items:center;gap:6px;color:var(--text);font-size:14px"><input type="checkbox" data-m="${m.key}" ${on(m.key) ? "checked" : ""}> ${m.key} <small style="color:var(--muted)">${m.id}${m.loaded ? " (loaded)" : ""}</small></label>`).join("");
+}
+$("asr-load").onclick = async () => {
+  $("asr-count").textContent = "loading…";
+  try {
+    asrState.clips = await (await api(`/api/asr_clips?role=${$("asr-role").value}&max_s=${$("asr-max").value}`)).json();
+    $("asr-count").textContent = `${asrState.clips.length} clip(s)`; asrRender();
+  } catch (e) { $("asr-count").textContent = "failed: " + e.message; }
+};
+$("asr-run").onclick = async () => {
+  const keys = [...document.querySelectorAll("#asr-models input:checked")].map(e => e.dataset.m);
+  const extra = $("asr-extra").value.trim(); if (extra) keys.push(extra);
+  const rels = [...document.querySelectorAll("#asr-rows input[data-i]:checked")].map(e => asrState.clips[+e.dataset.i].rel);
+  if (!keys.length || !rels.length) { $("asr-status").textContent = "pick at least one model and one clip"; return; }
+  $("asr-run").disabled = true; $("asr-status").textContent = `running ${keys.length} model(s) on ${rels.length} clip(s)… (first use of a model loads it)`;
+  try {
+    const d = await (await api("/api/asr_compare", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ clips: rels, models: keys }) })).json();
+    d.results.forEach(r => { if (!r.error) asrState.results[r.rel] = { ...(asrState.results[r.rel] || {}), ...r.results }; });
+    keys.forEach(k => { if (!asrState.models.includes(k)) asrState.models.push(k); });
+    $("asr-status").textContent = "done"; asrRender(); asrInit();
+  } catch (e) { $("asr-status").textContent = "failed: " + e.message; }
+  finally { $("asr-run").disabled = false; }
+};
+asrInit().catch(() => {});
+
+// ---------- ASR live mic test ----------
+const amState = { attempts: [], models: [], rec: null, stream: null, t0: 0, timer: null };
+function amRender() {
+  const ms = amState.models;
+  $("am-head").innerHTML = ms.length ? `<tr><th align="left">#</th><th>Recording</th><th>Truth (optional)</th>${ms.map(m => `<th>${asrEsc(m)}</th>`).join("")}</tr>` : "";
+  $("am-rows").innerHTML = amState.attempts.map((a, i) => `<tr><td>${i + 1}</td>` +
+    `<td><audio controls src="${a.url}" style="height:28px;width:200px"></audio><br><small style="color:var(--muted)">${a.seconds.toFixed(1)} s</small></td>` +
+    `<td><input data-at="${i}" value="${asrEsc(a.truth)}" style="width:140px"></td>` +
+    ms.map(m => { const r = a.results[m]; if (!r) return "<td></td>"; const cer = a.truth.trim() === "" ? null : asrCer(a.truth, r.text);
+      return `<td>${r.text ? asrEsc(r.text) : "<small style='color:var(--muted)'>(empty)</small>"}<br><small style="color:var(--muted)"><b>${r.ms} ms</b>${cer == null ? "" : ` · CER ${(cer * 100).toFixed(0)}%`}</small></td>`; }).join("") + "</tr>").join("");
+  $("am-rows").querySelectorAll("input[data-at]").forEach(el => el.onchange = () => { amState.attempts[+el.dataset.at].truth = el.value; amRender(); });
+  $("am-summary").innerHTML = ms.length && amState.attempts.length ? "<table class='tbl'><tr><th align='left'>Model</th><th>Recordings</th><th>Average time</th><th>Fastest</th><th>Slowest</th><th>Mean CER (labeled)</th></tr>" + ms.map(m => {
+    const rs = amState.attempts.filter(a => a.results[m]), t = rs.map(a => a.results[m].ms);
+    const lab = rs.filter(a => a.truth.trim() !== ""), cer = lab.length ? lab.reduce((s, a) => s + asrCer(a.truth, a.results[m].text), 0) / lab.length : null;
+    return `<tr><td>${asrEsc(m)}</td><td align="right">${rs.length}</td><td align="right"><b>${t.length ? Math.round(t.reduce((a, b) => a + b, 0) / t.length) : "–"} ms</b></td><td align="right">${t.length ? Math.min(...t) : "–"} ms</td><td align="right">${t.length ? Math.max(...t) : "–"} ms</td><td align="right">${cer == null ? "–" : (cer * 100).toFixed(1) + "%"}</td></tr>`;
+  }).join("") + "</table>" : "";
+}
+async function amStop() {
+  const r = amState.rec; if (!r) return;
+  clearInterval(amState.timer); amState.rec = null;
+  r.stop();  // onstop does the rest
+}
+$("am-rec").onclick = async () => {
+  if (amState.rec) { amStop(); return; }
+  const keys = [...document.querySelectorAll("#asr-models input:checked")].map(e => e.dataset.m);
+  const extra = $("asr-extra").value.trim(); if (extra) keys.push(extra);
+  if (!keys.length) { $("am-status").textContent = "check at least one model above"; return; }
+  try { amState.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false } }); }
+  catch (e) { $("am-status").textContent = "mic blocked: " + e.message; return; }
+  const chunks = [], rec = new MediaRecorder(amState.stream);
+  amState.rec = rec; amState.t0 = Date.now();
+  rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+  rec.onstop = async () => {
+    amState.stream.getTracks().forEach(t => t.stop());
+    $("am-rec").textContent = "● Record"; $("am-rec").classList.add("primary");
+    const blob = new Blob(chunks, { type: rec.mimeType || "audio/webm" });
+    $("am-status").textContent = `transcribing with ${keys.length} model(s)… (first use of a model loads it)`;
+    try {
+      const fd = new FormData(); fd.append("audio", blob, "live.webm"); fd.append("models", keys.join(","));
+      const d = await (await api("/api/asr_compare_upload", { method: "POST", body: fd })).json();
+      keys.forEach(k => { if (!amState.models.includes(k)) amState.models.push(k); });
+      amState.attempts.push({ url: URL.createObjectURL(blob), seconds: d.seconds, results: d.results, truth: "" });
+      $("am-status").textContent = "done — record again, or type the truth to get an error rate"; amRender(); asrInit();
+    } catch (e) { $("am-status").textContent = "failed: " + e.message; }
+  };
+  rec.start();
+  $("am-rec").textContent = "■ Stop & transcribe"; $("am-rec").classList.remove("primary");
+  amState.timer = setInterval(() => { $("am-status").textContent = `recording… ${((Date.now() - amState.t0) / 1000).toFixed(1)} s`; }, 200);
+};
+
 // ---------- final lengthening A/B ----------
 let llClips = [];
 $("ll-ms").oninput = () => $("ll-msv").textContent = $("ll-ms").value;
@@ -791,7 +960,7 @@ function showDebugGroup(g) {
   try { localStorage.setItem("dbg_group", g); } catch (e) {}
 }
 document.querySelectorAll("#dsubtabs button").forEach(b => b.onclick = () => showDebugGroup(b.dataset.d));
-{ let g = "live"; try { g = localStorage.getItem("dbg_group") || "live"; } catch (e) {} showDebugGroup(["live", "cues", "bc", "llm"].includes(g) ? g : "live"); }
+{ let g = "live"; try { g = localStorage.getItem("dbg_group") || "live"; } catch (e) {} showDebugGroup(["live", "cues", "bc", "asr", "llm"].includes(g) ? g : "live"); }
 
 function showTab(name) {
   $("view-chat").hidden = name !== "chat"; $("view-debug").hidden = name !== "debug";
