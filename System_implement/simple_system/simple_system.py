@@ -21,6 +21,7 @@ import traceback
 import urllib.request
 import sys
 import re
+import zlib
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -255,8 +256,60 @@ def finalize_recording_locked():
         log_q.put(("ai_pad", mic_rec["ai_path"], mic_rec["samples"] / mic_rec["sr"]))
 
 
+# Final lengthening factors per kind of phrase ending. The ORDER (clause-final particles lengthen more at deeper
+# boundaries; ne longer than yo) follows Den 2015 and a 2025 J. Japanese Linguistics study; the VALUES are design
+# choices tuned by ear (no paper gives a per-particle ratio). Editable from the Debug tab.
+STRETCH_DEFAULTS = {"ne_final": 1.9, "yo_final": 1.6, "sa_final": 1.7, "link": 1.4, "ne_mid": 1.6, "yo_mid": 1.6, "sa_mid": 1.6}
+STRETCH_LABELS = [  # (key, label, example): final = ends the sentence (。), mid = followed by more (、)
+    ("ne_final", "ね at sentence end", "楽しかったね。"), ("yo_final", "よ at sentence end", "おいしかったよ。"),
+    ("sa_final", "さ at sentence end", "そうだったさ。"), ("ne_mid", "ね mid-sentence", "昨日ね、"),
+    ("yo_mid", "よ mid-sentence", "ほんとだよ、"), ("sa_mid", "さ mid-sentence", "行ってさ、"),
+    ("link", "clause link (て / けど / が)", "寄ったんだけど、"),
+]
+STRETCH_JITTER = 0.1  # each stretched chunk gets its factor +- up to this much (variety within a conversation)
+PARTICLE_KEY = {"ね": "ne", "よ": "yo", "さ": "sa"}
+ENDING_RE = re.compile(r"(ね|よ|さ|けど|けれど|が|て)([。、]?)$")
+
+
+def classify_ending(text: str) -> str | None:
+    m = ENDING_RE.search(text.strip())
+    if not m:
+        return None
+    part, punct = m.groups()
+    if part in ("けど", "けれど", "が", "て"):
+        return "link"
+    return f"{PARTICLE_KEY[part]}_{'mid' if punct == '、' else 'final'}"
+
+
+class TailStretcher:
+    """Picks the final-lengthening factor of a chunk from its ending (table) plus a small random jitter drawn from a
+    per-conversation generator, so factors vary within and across conversations."""
+    def __init__(self, seed=None):
+        self.rng = random.Random(seed)
+        self.eligible, self.factors = 0, []
+
+    def decide(self, text: str, table: dict | None, jitter: float) -> tuple[str, float] | None:
+        key = classify_ending(text)
+        if not key:
+            return None
+        self.eligible += 1
+        base = float((table or {}).get(key, STRETCH_DEFAULTS[key]))
+        if base <= 1.0:
+            return None
+        f = round(max(1.0, base + self.rng.uniform(-jitter, jitter)), 2)
+        if f <= 1.0:
+            return None
+        self.factors.append(f)
+        return key, f
+
+
+tail_stretcher = TailStretcher()  # one per conversation: replaced in new_session()
+
+
 def new_session(kind: str | None = None):
     """Start a fresh log folder. Normal chats: logs/normal/<time>; debug/test runs: logs/debug/debug_<time>."""
+    global tail_stretcher
+    tail_stretcher = TailStretcher()
     with log_lock:
         if kind:
             session["kind"] = kind
@@ -450,6 +503,8 @@ class TTSRequest(BaseModel):
     style: str = "Neutral"
     style_weight: float = 5.0
     length: float = 1.0  # >1.0 slower
+    stretch_table: dict[str, float] | None = None  # final-lengthening factor per ending kind (None = STRETCH_DEFAULTS)
+    stretch_jitter: float = STRETCH_JITTER
 
 
 @app.get("/api/llms")
@@ -614,7 +669,7 @@ def trim_silence(wav: np.ndarray, sr: int, thr: float = 0.01, lead_ms: int = 30,
 # Final lengthening on the last particle of a chunk: the chunk is synthesized in ONE pass (so it stays continuous),
 # then the last TAIL_MS of the audio is time-stretched by TAIL_STRETCH (pitch kept) and cross-faded back in.
 TAIL_PARTICLE = re.compile(r"(ね|さ|よ|けど|けれど|が|て)[。、]?$")
-TAIL_MS, TAIL_STRETCH, TAIL_FADE_MS = 200, 1.7, 20
+TAIL_MS, TAIL_STRETCH, TAIL_FADE_MS = 200, 2.0, 20
 
 
 def lengthen_tail(wav: np.ndarray, sr: int, tail_ms: int = TAIL_MS, stretch: float = TAIL_STRETCH) -> np.ndarray:
@@ -648,12 +703,64 @@ def to_wav_bytes(wav: np.ndarray, sr: int) -> bytes:
     return buf.getvalue()
 
 
-def synth(req: TTSRequest) -> bytes:
-    """Text -> WAV bytes (silence at both ends trimmed, final particle lengthened)."""
+def synth(req: TTSRequest, stretch: float | None = None) -> bytes:
+    """Text -> WAV bytes (silence at both ends trimmed; the end lengthened by factor `stretch` when given)."""
     wav, sr = synth_raw(req)
-    if TAIL_PARTICLE.search(req.text):
-        wav = lengthen_tail(wav, sr)
+    if stretch and stretch > 1.0:
+        wav = lengthen_tail(wav, sr, stretch=stretch)
     return to_wav_bytes(wav, sr)
+
+
+@app.get("/api/stretch_defaults")
+def api_stretch_defaults():
+    return {"table": STRETCH_DEFAULTS, "jitter": STRETCH_JITTER,
+            "labels": [{"key": k, "label": l, "example": e} for k, l, e in STRETCH_LABELS]}
+
+
+SENTENCE_ONLY_END = re.compile(r"[^。！？!?\n]*[。！？!?\n]+")  # the old rule: sentence-level chunks only
+
+
+def split_chunks(text: str, pattern: re.Pattern) -> list[str]:
+    """Same loop as api_chat_stream: peel chunks off the front; whatever is left at the end is the last chunk."""
+    out, buf = [], text
+    while (m := pattern.match(buf)):
+        out.append(m.group().strip())
+        buf = buf[m.end():]
+    if buf.strip():
+        out.append(buf.strip())
+    return [c for c in out if SPEAKABLE.search(c)]
+
+
+class ChunkTestRequest(TTSRequest):
+    text: str = ""  # unused (inherited): the replies come from `texts`
+    texts: list[str]
+
+
+@app.post("/api/chunk_test")
+def api_chunk_test(req: ChunkTestRequest):
+    """Debug: split each reply into sentence-level chunks (old rule) and phrase-level chunks (new rule), synthesize
+    every chunk exactly as live chat does (final lengthening included), so the two can be played with the same pause."""
+    def build(chunks, stretcher=None):
+        clips = []
+        for c in chunks:
+            d = stretcher.decide(c, req.stretch_table, req.stretch_jitter) if stretcher else None
+            wav = synth(req.model_copy(update={"text": c}), stretch=d[1] if d else None)
+            with sf.SoundFile(io.BytesIO(wav)) as f:
+                dur = len(f) / f.samplerate
+            clips.append({"text": c, "seconds": dur, "audio": base64.b64encode(wav).decode(),
+                          "factor": d[1] if d else None, "kind": d[0] if d else None})
+        return clips
+    out = []
+    for text in req.texts:  # one fresh stretcher per reply: it mimics the start of one conversation
+        text = text.strip()
+        if text:
+            phrase = split_chunks(text, SENTENCE_END)
+            st = TailStretcher()
+            out.append({"text": text,
+                        "sentence": build(split_chunks(text, SENTENCE_ONLY_END)),
+                        "phrase": build(phrase),
+                        "phrase_q": build(phrase, st), "eligible": st.eligible, "factors": st.factors})
+    return {"results": out}
 
 
 class LengthenTestRequest(TTSRequest):
@@ -677,7 +784,8 @@ def api_lengthen_test(req: LengthenTestRequest):
         out.append({"text": text, "applies": applies, "sr": sr,
                     "plain_s": len(wav) / sr, "long_s": len(long) / sr,
                     "plain": base64.b64encode(to_wav_bytes(wav, sr)).decode(),
-                    "long": base64.b64encode(to_wav_bytes(long, sr)).decode()})
+                    "long": base64.b64encode(to_wav_bytes(long, sr)).decode(),
+                })
     return {"results": out}
 
 
@@ -882,7 +990,8 @@ def api_chat_stream(req: StreamRequest):
                 return None
             t1 = time.perf_counter()
             try:
-                audio = synth(req.model_copy(update={"text": sentence}))
+                d = None if fallback else tail_stretcher.decide(sentence, req.stretch_table, req.stretch_jitter)
+                audio = synth(req.model_copy(update={"text": sentence}), stretch=d[1] if d else None)
             except Exception as e:  # one unspeakable sentence must not kill the whole reply
                 traceback.print_exc()
                 problem(f"TTS failed, sentence skipped: {e!r}", sentence=sentence)
@@ -893,7 +1002,7 @@ def api_chat_stream(req: StreamRequest):
             with spec_lock:  # while speculative and not committed, logging is parked; commit flushes it
                 hold = spec["hold"] if spec and not spec["committed"] else None
                 clip_id = log_audio("ai", audio, hold=hold)
-                log_chat("ai", sentence, clip_id, hold=hold, turn=my_turn, **({"fallback": True} if fallback else {}))
+                log_chat("ai", sentence, clip_id, hold=hold, turn=my_turn, stretch_kind=d[0] if d else None, stretch_factor=d[1] if d else None, **({"fallback": True} if fallback else {}))
             return json.dumps({"text": sentence, "audio": base64.b64encode(audio).decode(), "id": clip_id}) + "\n"
 
         def llm_chunks():

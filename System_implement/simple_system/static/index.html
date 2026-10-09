@@ -39,6 +39,14 @@
   #state[data-s=speaking] { --c:#7c3aed; } #state[data-s=speaking] .dot { animation:pulse .7s ease-in-out infinite; }
   #state[data-s=error] { --c:#dc2626; }
   @keyframes pulse { 50% { transform:scale(1.5); opacity:.45; } }
+  .ck-chunk { padding:1px 4px; border-radius:4px; }
+  .ck-chunk.on { background:var(--accent); color:#fff; }
+  [hidden] { display:none !important; }
+  .subtabs { display:flex; gap:4px; flex-wrap:wrap; border-bottom:2px solid #d8dce2; margin:4px 0 12px; }
+  .subtabs button { border:0; border-radius:8px 8px 0 0; background:transparent; color:var(--muted); padding:8px 14px; font-weight:600; margin-bottom:-2px; border-bottom:2px solid transparent; }
+  .subtabs button.active { color:var(--accent); border-bottom-color:var(--accent); background:var(--card); }
+  [data-dsub] > h2:first-child, [data-dsub] > .row > h2:first-child { font-size:15px !important; padding-bottom:6px; border-bottom:1px solid #e5e7eb; }
+  [data-dsub] { margin-bottom:14px; }
   .tabs { display:flex; gap:6px; }
   .tabs button.active { background:var(--accent); color:#fff; border-color:transparent; }
   .kv { display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:6px 14px; font-size:13px; }
@@ -97,12 +105,18 @@
 
   </div>
 
-  <div id="view-debug" hidden>
-    <section class="card">
+    <div id="view-debug" hidden>
+    <div class="subtabs" id="dsubtabs">
+      <button data-d="live">Live &amp; decisions</button>
+      <button data-d="cues">Aizuchi cues</button>
+      <button data-d="bc">Backchannel test &amp; log</button>
+      <button data-d="llm">LLM benchmark</button>
+    </div>
+    <section class="card" data-dsub="live">
       <h2 style="font-size:14px;margin:0 0 8px">Live state <small style="color:var(--muted)">— speak a short “うん” while the AI is talking to test backchannel</small></h2>
       <div class="kv" id="live"></div>
     </section>
-    <section class="card">
+    <section class="card" data-dsub="llm">
       <h2 style="font-size:14px;margin:0 0 8px">LLM latency benchmark <small style="color:var(--muted)">— same prompts on every available LLM</small></h2>
       <div class="row" style="align-items:center">
         <label>Runs per prompt <input id="bench-reps" type="number" min="1" max="10" value="3" style="width:70px"></label>
@@ -112,7 +126,16 @@
       <div style="color:var(--muted);font-size:12px;margin:6px 0">Stop the conversation first (it shares the GPU). “First sentence” is what gates the voice; lower is better.</div>
       <div id="bench-out"></div>
     </section>
-    <section class="card">
+    <section class="card" data-dsub="cues">
+      <h2 style="font-size:14px;margin:0 0 8px">Final lengthening factors <small style="color:var(--muted)">— how much each kind of phrase ending is stretched (×1.0 = not at all)</small></h2>
+      <table class="tbl"><thead><tr><th align="left">Ending</th><th align="left">Example</th><th>Stretch ×</th></tr></thead><tbody id="sf-rows"></tbody></table>
+      <div class="row" style="align-items:center;margin-top:8px">
+        <label>Random variation ±<span id="sj-v">0.10</span> <input id="sj" type="range" min="0" max="0.4" step="0.05" value="0.1"></label>
+        <button id="sf-reset">Reset to defaults</button>
+      </div>
+      <div style="color:var(--muted);font-size:12px;margin-top:6px">Used by live chat and by the third row of the Phrase chunking card (★×factor marks stretched chunks). Each stretched chunk gets its ending's factor plus a random variation, so the stretch differs from chunk to chunk and between conversations. The order (deeper boundaries and ね longer than よ) follows Den 2015 and a 2025 J. Japanese Linguistics study; the values are our own choices, tune them by ear. Every AI line in the saved log records its kind and factor. The A/B card below stretches every eligible ending with one factor, to hear the effect.</div>
+    </section>
+    <section class="card" data-dsub="cues">
       <h2 style="font-size:14px;margin:0 0 8px">Final lengthening A/B <small style="color:var(--muted)">— same synthesis, with and without the stretched ending</small></h2>
       <textarea id="ll-text" rows="7" style="width:100%;box-sizing:border-box">昨日ね、近所の公園に行ってさ、
 桜がちょうど満開だったんだよ。
@@ -120,18 +143,30 @@
 焼きたてのクロワッサンがすごくおいしかったよ。
 海外旅行のときもね、朝ごはんが楽しみでさ、
 毎朝その土地のパンを食べてたんだ。
-あなたはどんな旅行が好きなの。</textarea>
-      <div style="color:var(--muted);font-size:12px;margin:4px 0">One chunk per line (LLM-style phrases ending in ね / さ / よ / て / けど). The last line has no particle, so both versions are identical.</div>
+あなたはどんな旅行が好き。</textarea>
+      <div style="color:var(--muted);font-size:12px;margin:4px 0">One chunk per line (LLM-style phrases ending in ね / さ / よ / て / けど). A line without one of these endings is identical in both versions.</div>
       <div class="row" style="align-items:center">
         <label>Tail length: <span id="ll-msv">200</span> ms <input id="ll-ms" type="range" min="80" max="400" step="20" value="200"></label>
-        <label>Stretch: ×<span id="ll-stv">1.5</span> <input id="ll-st" type="range" min="1.1" max="2.5" step="0.1" value="1.5"></label>
+        <label>Stretch: ×<span id="ll-stv">1.9</span> <input id="ll-st" type="range" min="1.1" max="2.5" step="0.1" value="1.9"></label>
         <button id="ll-run" class="primary">▶ Generate</button>
         <button id="ll-seq">▶▶ Play all (plain → lengthened, 400 ms gap)</button>
         <span id="ll-status" style="color:var(--muted);font-size:13px"></span>
       </div>
       <table class="tbl" style="margin-top:8px"><thead><tr><th align="left">Text</th><th>Plain</th><th>Lengthened</th><th>Δ length</th></tr></thead><tbody id="ll-rows"></tbody></table>
     </section>
-    <section class="card">
+    <section class="card" data-dsub="cues">
+      <h2 style="font-size:14px;margin:0 0 8px">Phrase chunking <small style="color:var(--muted)">— sentence-level (old) vs phrase-level (new), with and without final lengthening, played with the same pause</small></h2>
+      <textarea id="ck-text" rows="4" style="width:100%;box-sizing:border-box">昨日ね、近所の公園に行ってさ、桜がちょうど満開だったんだよ。それでね、帰りにパン屋さんに寄ったんだけど、焼きたてのクロワッサンがすごくおいしかったよ。
+海外旅行のときもね、朝ごはんが楽しみでさ、毎朝その土地のパンを食べてたんだ。あなたはどんな旅行が好きなの。</textarea>
+      <div style="color:var(--muted);font-size:12px;margin:4px 0">One LLM-style reply per line. Chunks are synthesized like live chat (only the last row has final lengthening, with the factors set above; ★ = stretched) and played with the “Pause between sentences” value from the Chat tab (<b id="ck-pause"></b> ms, plus about 130 ms at the clip edges).</div>
+      <div class="row" style="align-items:center">
+        <button id="ck-run" class="primary">▶ Generate</button>
+        <button id="ck-stop">■ Stop</button>
+        <span id="ck-status" style="color:var(--muted);font-size:13px"></span>
+      </div>
+      <div id="ck-out" style="margin-top:8px"></div>
+    </section>
+    <section class="card" data-dsub="bc">
       <h2 style="font-size:14px;margin:0 0 8px">Backchannel logging test <small style="color:var(--muted)">— no LLM</small></h2>
       <div class="row" style="align-items:center">
         <label style="display:flex;flex-direction:row;align-items:center;gap:6px;color:var(--text);font-size:14px">
@@ -144,7 +179,7 @@
         4) Check <b>Saved log</b> below for <span class="role backchannel">backchannel</span> rows with audio. Speaking longer than the interrupt time cuts the AI off and gets another random sentence.
       </div>
     </section>
-    <section class="card row">
+    <section class="card row" data-dsub="bc">
       <label>Interrupt after (s) — shorter speech = backchannel
         <input id="dbg-barge" type="number" min="0.3" max="5" step="0.1" value="1.0">
       </label>
@@ -164,11 +199,11 @@
         <input id="dbg-filler-on" type="checkbox"> Filler backchannel on pauses
       </label>
     </section>
-    <section class="card">
+    <section class="card" data-dsub="live">
       <h2 style="font-size:14px;margin:0 0 8px">Decisions <small style="color:var(--muted)">(this browser)</small> <button id="dbg-clear" style="float:right;padding:2px 8px">Clear</button></h2>
       <div id="dbglog"></div>
     </section>
-    <section class="card">
+    <section class="card" data-dsub="bc">
       <div class="row" style="justify-content:space-between;align-items:center">
         <h2 style="font-size:14px;margin:0">Saved log <small id="dbg-sess" style="color:var(--muted)"></small></h2>
         <label style="display:flex;flex-direction:row;align-items:center;gap:6px">
@@ -313,7 +348,7 @@ function startStream(text, speculative) {
     const r = await api("/api/chat_stream", {
       method: "POST", headers: {"Content-Type": "application/json"}, signal: s.ctrl.signal,
       body: JSON.stringify({ text, speculative, spec_id: s.id, llm: $("llm").value, test: $("dbg-test").checked, model: $("model").value,
-                             style: $("style").value, style_weight: +$("sw").value, length: +$("len").value }),
+                             style: $("style").value, style_weight: +$("sw").value, length: +$("len").value, stretch_table: STRETCH_TABLE, stretch_jitter: STRETCH_JITTER }),
     });
     const reader = r.body.getReader(), dec = new TextDecoder();
     let buf = "";
@@ -651,11 +686,11 @@ $("ll-run").onclick = async () => {
     const d = await (await api("/api/lengthen_test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
       texts: $("ll-text").value.split("\n"), model: $("model").value, style: $("style").value, style_weight: +$("sw").value, length: +$("len").value, tail_ms: +$("ll-ms").value, stretch: +$("ll-st").value }) })).json();
     const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
-    llClips = d.results.flatMap(r => [r.plain, r.long]);
+    llClips = d.results.flatMap(r => r.applies ? [r.plain, r.long] : [r.plain]);
+    const au = b => `<td><audio controls preload="auto" src="data:audio/wav;base64,${b}" style="height:30px"></audio></td>`;
     $("ll-rows").innerHTML = d.results.map(r => `<tr><td>${esc(r.text)}${r.applies ? "" : " <small style='color:var(--muted)'>(no particle: identical)</small>"}</td>` +
-      `<td><audio controls preload="auto" src="data:audio/wav;base64,${r.plain}" style="height:30px"></audio></td>` +
-      `<td><audio controls preload="auto" src="data:audio/wav;base64,${r.long}" style="height:30px"></audio></td>` +
-      `<td align="right">${r.plain_s.toFixed(2)} → ${r.long_s.toFixed(2)} s (+${((r.long_s - r.plain_s) * 1000).toFixed(0)} ms)</td></tr>`).join("");
+      au(r.plain) + au(r.long) +
+      `<td align="right">${r.plain_s.toFixed(2)} → ${r.long_s.toFixed(2)} s (+${((r.long_s - r.plain_s) * 1000).toFixed(0)} ms)</td>` + "</tr>").join("");
     $("ll-status").textContent = "done";
   } catch (e) { $("ll-status").textContent = "failed: " + e.message; }
   finally { $("ll-run").disabled = false; }
@@ -667,6 +702,63 @@ $("ll-seq").onclick = async () => {
     await new Promise(r => { a.onended = r; a.onerror = r; a.play().catch(r); });
     await new Promise(r => setTimeout(r, 400));
   }
+};
+// ---------- phrase chunking A/B ----------
+let STRETCH_TABLE = {}, STRETCH_JITTER = 0.1, STRETCH_DEFAULTS = {};
+function saveStretch() { try { localStorage.setItem("stretch", JSON.stringify({ t: STRETCH_TABLE, j: STRETCH_JITTER })); } catch (e) {} }
+async function initStretch() {
+  const d = await (await api("/api/stretch_defaults")).json();
+  STRETCH_DEFAULTS = d.table; STRETCH_TABLE = { ...d.table }; STRETCH_JITTER = d.jitter;
+  try { const s = JSON.parse(localStorage.getItem("stretch") || "null"); if (s) { Object.assign(STRETCH_TABLE, s.t); STRETCH_JITTER = s.j; } } catch (e) {}
+  $("sf-rows").innerHTML = d.labels.map(l => `<tr><td>${l.label}</td><td>${l.example}</td><td align="center"><input type="number" min="1" max="2.5" step="0.05" data-k="${l.key}" style="width:80px"></td></tr>`).join("");
+  const sync = () => { document.querySelectorAll("#sf-rows input").forEach(i => i.value = STRETCH_TABLE[i.dataset.k]); $("sj").value = STRETCH_JITTER; $("sj-v").textContent = STRETCH_JITTER.toFixed(2); };
+  sync();
+  document.querySelectorAll("#sf-rows input").forEach(i => i.onchange = () => { STRETCH_TABLE[i.dataset.k] = Math.min(2.5, Math.max(1, +i.value || 1)); i.value = STRETCH_TABLE[i.dataset.k]; saveStretch(); });
+  $("sj").oninput = () => { STRETCH_JITTER = +$("sj").value; $("sj-v").textContent = STRETCH_JITTER.toFixed(2); saveStretch(); };
+  $("sf-reset").onclick = () => { STRETCH_TABLE = { ...STRETCH_DEFAULTS }; STRETCH_JITTER = d.jitter; sync(); saveStretch(); };
+}
+initStretch().catch(e => console.warn("stretch defaults:", e));
+let ckEpoch = 0;
+const ckAudio = new Audio();
+function ckStop() { ckEpoch++; ckAudio.pause(); document.querySelectorAll(".ck-chunk.on").forEach(e => e.classList.remove("on")); }
+async function ckPlay(clips, spans) {
+  ckStop(); const me = ckEpoch;
+  for (let i = 0; i < clips.length; i++) {
+    if (i > 0) { await new Promise(r => setTimeout(r, PAUSE_MS)); if (me !== ckEpoch) return; }  // the aizuchi slot
+    spans[i].classList.add("on");
+    ckAudio.src = "data:audio/wav;base64," + clips[i].audio;
+    await new Promise(r => { ckAudio.onended = r; ckAudio.onerror = r; ckAudio.play().catch(r); });
+    spans[i].classList.remove("on");
+    if (me !== ckEpoch) return;
+  }
+}
+$("ck-stop").onclick = ckStop;
+$("ck-run").onclick = async () => {
+  ckStop(); $("ck-run").disabled = true; $("ck-status").textContent = "generating…"; $("ck-pause").textContent = PAUSE_MS;
+  try {
+    const d = await (await api("/api/chunk_test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
+      texts: $("ck-text").value.split("\n"), model: $("model").value, style: $("style").value, style_weight: +$("sw").value, length: +$("len").value, stretch_table: STRETCH_TABLE, stretch_jitter: STRETCH_JITTER }) })).json();
+    const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+    $("ck-out").innerHTML = "";
+    const plays = [];
+    d.results.forEach((r, ri) => {
+      const box = document.createElement("div"); box.style.cssText = "border-top:1px solid var(--line,#ddd);padding:8px 0";
+      box.innerHTML = [["sentence", "Sentence-level (old)"], ["phrase", "Phrase-level (new)"], ["phrase_q", "Phrase-level + final lengthening (per-ending factors)"]].map(([k, label]) => {
+        const c = r[k], sp = c.reduce((a, x) => a + x.seconds, 0), gaps = Math.max(0, c.length - 1);
+        return `<div style="margin:6px 0"><b>${label}</b> <button data-p="${ri}-${k}">▶ Play</button> ` +
+          `<small style="color:var(--muted)">${c.length} chunk(s), ${gaps} aizuchi slot(s), speech ${sp.toFixed(1)} s + pauses ${(gaps * (PAUSE_MS + 130) / 1000).toFixed(1)} s` +
+          (k === "phrase_q" ? `, <b>${r.factors.length} of ${r.eligible}</b> eligible endings stretched` + (r.factors.length ? ` (×${Math.min(...r.factors).toFixed(2)}–×${Math.max(...r.factors).toFixed(2)})` : "") : "") + `</small><br>` +
+          c.map((x, i) => `<span class="ck-chunk" data-i="${i}">${esc(x.text)}${x.factor ? ` ★×${x.factor}` : ""}</span>`).join('<span style="color:var(--muted)"> | </span>') + `</div>`;
+      }).join("");
+      $("ck-out").appendChild(box);
+      box.querySelectorAll("button[data-p]").forEach(b => {
+        const k = b.dataset.p.split("-")[1];
+        b.onclick = () => ckPlay(r[k], [...b.parentElement.querySelectorAll(".ck-chunk")]);
+      });
+    });
+    $("ck-status").textContent = "done";
+  } catch (e) { $("ck-status").textContent = "failed: " + e.message; }
+  finally { $("ck-run").disabled = false; }
 };
 $("dbg-speak").onclick = async () => {
   unlockAudio(); await setTestMode(true);
@@ -680,6 +772,15 @@ $("dbg-spec-at").onchange = () => SPEC_AT = +$("dbg-spec-at").value;
 $("dbg-spec-on").onchange = () => SPEC_ON = $("dbg-spec-on").checked;
 $("dbg-filler-at").onchange = () => FILLER_AT = +$("dbg-filler-at").value;
 $("dbg-filler-on").onchange = () => FILLER_ON = $("dbg-filler-on").checked;
+
+// Debug sub-tabs: one group of tools at a time instead of one long page.
+function showDebugGroup(g) {
+  document.querySelectorAll("[data-dsub]").forEach(e => e.hidden = e.dataset.dsub !== g);
+  document.querySelectorAll("#dsubtabs button").forEach(b => b.classList.toggle("active", b.dataset.d === g));
+  try { localStorage.setItem("dbg_group", g); } catch (e) {}
+}
+document.querySelectorAll("#dsubtabs button").forEach(b => b.onclick = () => showDebugGroup(b.dataset.d));
+{ let g = "live"; try { g = localStorage.getItem("dbg_group") || "live"; } catch (e) {} showDebugGroup(["live", "cues", "bc", "llm"].includes(g) ? g : "live"); }
 
 function showTab(name) {
   $("view-chat").hidden = name !== "chat"; $("view-debug").hidden = name !== "debug";
