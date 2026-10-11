@@ -184,18 +184,19 @@ if not LLMS[DEFAULT_LLM]["ok"]:
     DEFAULT_LLM = active_llm = next((k for k, v in LLMS.items() if v["ok"]), DEFAULT_LLM)
 
 
-def _gemini_stream(messages, cancelled):
+def _gemini_stream(messages, cancelled, system=None):
     contents = [types.Content(role="model" if r == "assistant" else r, parts=[types.Part(text=t)]) for r, t in messages]
-    for chunk in client.models.generate_content_stream(model=GEMINI_MODEL, contents=contents, config=LLM_CONFIG):
+    config = types.GenerateContentConfig(system_instruction=system) if system else LLM_CONFIG
+    for chunk in client.models.generate_content_stream(model=GEMINI_MODEL, contents=contents, config=config):
         if cancelled():
             return
         if chunk.text:
             yield chunk.text
 
 
-def _gemma_stream(messages, cancelled):
+def _gemma_stream(messages, cancelled, system=None):
     """Stream from the llama.cpp server. Dropping the connection makes the server stop generating at once."""
-    chat = [{"role": "system", "content": SYSTEM_PROMPT}] + [{"role": r, "content": t} for r, t in messages[-GEMMA_HISTORY_MESSAGES:]]
+    chat = [{"role": "system", "content": system or SYSTEM_PROMPT}] + [{"role": r, "content": t} for r, t in messages[-GEMMA_HISTORY_MESSAGES:]]
     body = {"model": "gemma", "messages": chat, "stream": True, "max_tokens": GEMMA_MAX_NEW_TOKENS,
             "temperature": 1.0, "top_k": 64, "top_p": 0.95,   # Google's recommended sampling for Gemma 4
             "cache_prompt": True,                              # reuse the shared start of the conversation between turns
@@ -221,14 +222,14 @@ def _gemma_stream(messages, cancelled):
         resp.close()
 
 
-def llm_stream(messages, cancelled=lambda: False, llm=None):
+def llm_stream(messages, cancelled=lambda: False, llm=None, system=None):
     """Yield the reply text piece by piece from the chosen LLM ("gemini" | "gemma")."""
     global active_llm
     llm = llm or DEFAULT_LLM
     if llm not in LLMS or not LLMS[llm]["ok"]:
         raise RuntimeError(f"LLM {llm!r} is not available")
     active_llm = llm
-    yield from (_gemini_stream if llm == "gemini" else _gemma_stream)(messages, cancelled)
+    yield from (_gemini_stream if llm == "gemini" else _gemma_stream)(messages, cancelled, system)
 
 
 # Full duplex: a newer request (or /api/interrupt) bumps `turn_no`, which makes the running reply stop.
@@ -264,12 +265,14 @@ def finalize_recording_locked():
 # Final lengthening factors per kind of phrase ending. The ORDER (clause-final particles lengthen more at deeper
 # boundaries; ne longer than yo) follows Den 2015 and a 2025 J. Japanese Linguistics study; the VALUES are design
 # choices tuned by ear (no paper gives a per-particle ratio). Editable from the Debug tab.
-STRETCH_DEFAULTS = {"ne_final": 1.9, "yo_final": 1.6, "sa_final": 1.7, "link": 1.4, "ne_mid": 1.6, "yo_mid": 1.6, "sa_mid": 1.6}
+STRETCH_DEFAULTS = {"ne_final": 1.9, "yo_final": 1.6, "sa_final": 1.7, "link": 1.4, "ne_mid": 1.6, "yo_mid": 1.6, "sa_mid": 1.6,
+                    "cue_s": 1.9, "cue_w": 1.4}  # cue_s / cue_w: script phrases marked |S (strong) or |W (weak)
 STRETCH_LABELS = [  # (key, label, example): final = ends the sentence (。), mid = followed by more (、)
     ("ne_final", "ね at sentence end", "楽しかったね。"), ("yo_final", "よ at sentence end", "おいしかったよ。"),
     ("sa_final", "さ at sentence end", "そうだったさ。"), ("ne_mid", "ね mid-sentence", "昨日ね、"),
     ("yo_mid", "よ mid-sentence", "ほんとだよ、"), ("sa_mid", "さ mid-sentence", "行ってさ、"),
     ("link", "clause link (て / けど / が)", "寄ったんだけど、"),
+    ("cue_s", "script phrase marked |S (strong cue)", "…楽しかったんですよね。|S"), ("cue_w", "script phrase marked |W (weak cue)", "…行ってきたんですけど、|W"),
 ]
 STRETCH_JITTER = 0.1  # each stretched chunk gets its factor +- up to this much (variety within a conversation)
 PARTICLE_KEY = {"ね": "ne", "よ": "yo", "さ": "sa"}
@@ -308,6 +311,21 @@ class TailStretcher:
         return key, f
 
 
+def decide_cue(self, cue: str, table: dict | None, jitter: float):
+    """Script phrases marked |S / |W are stretched by the strong / weak factor whatever their ending is."""
+    key = f"cue_{cue.lower()}"
+    base = float((table or {}).get(key, STRETCH_DEFAULTS[key]))
+    if base <= 1.0:
+        return None
+    f = round(max(1.0, base + self.rng.uniform(-jitter, jitter)), 2)
+    if f <= 1.0:
+        return None
+    self.eligible += 1
+    self.factors.append(f)
+    return key, f
+
+
+TailStretcher.decide_cue = decide_cue
 tail_stretcher = TailStretcher()  # one per conversation: replaced in new_session()
 
 
@@ -427,7 +445,8 @@ def log_writer():
                 with open(where / "chatlog.jsonl", "a", encoding="utf-8") as f:
                     f.write(json.dumps(payload, ensure_ascii=False) + "\n")
                 with open(where / "chatlog.txt", "a", encoding="utf-8") as f:
-                    f.write(f"[{payload['time'][11:23]}] {payload['role'].upper()}: {payload['text']}\n")
+                    tag = f"[{payload['source']}]" if payload.get("source") else ""  # who produced an AI line: script / llm / filler / fallback
+                    f.write(f"[{payload['time'][11:23]}] {payload['role'].upper()}{tag}: {payload['text']}\n")
         except Exception as e:
             print(f"[log] write failed: {e!r}", flush=True)
 
@@ -943,7 +962,7 @@ def api_filler(req: TTSRequest):
         _filler_cache[key] = synth(req)
     audio = _filler_cache[key]
     clip_id = log_audio("ai", audio)
-    log_chat("ai", req.text, clip_id, backchannel=True)
+    log_chat("ai", req.text, clip_id, backchannel=True, source="filler")
     return {"text": req.text, "audio": base64.b64encode(audio).decode(), "id": clip_id}
 
 
@@ -1029,6 +1048,7 @@ CONTINUE_PROMPT = "（相手は黙っています。気まずくならないよ�
 
 
 class StreamRequest(TTSRequest):
+    script_mode: bool = False  # a fixed script is running: the LLM only reacts briefly or answers an interjection
     cont: bool = False  # silence-breaking turn: `text` is ignored, CONTINUE_PROMPT is used and no user line is logged
     speculative: bool = False  # reply generated while you pause: nothing is logged/kept unless /api/spec/commit follows
     spec_id: str = ""
@@ -1168,7 +1188,8 @@ def api_chat_stream(req: StreamRequest):
             with spec_lock:  # while speculative and not committed, logging is parked; commit flushes it
                 hold = spec["hold"] if spec and not spec["committed"] else None
                 clip_id = log_audio("ai", audio, hold=hold)
-                log_chat("ai", sentence, clip_id, hold=hold, turn=my_turn, stretch_kind=d[0] if d else None, stretch_factor=d[1] if d else None, **({"continued": True} if req.cont else {}), **({"fallback": True} if fallback else {}))
+                log_chat("ai", sentence, clip_id, hold=hold, turn=my_turn, source="fallback" if fallback else "llm", script_mode=req.script_mode or None,
+                         stretch_kind=d[0] if d else None, stretch_factor=d[1] if d else None, **({"continued": True} if req.cont else {}), **({"fallback": True} if fallback else {}))
             return json.dumps({"text": sentence, "audio": base64.b64encode(audio).decode(), "id": clip_id}) + "\n"
 
         def llm_chunks():
@@ -1180,7 +1201,8 @@ def api_chat_stream(req: StreamRequest):
             for attempt in range(1, LLM_ATTEMPTS + 1):
                 got = False
                 try:
-                    stream = llm_stream(history + [user], cancelled, req.llm or None)
+                    stream = llm_stream(history + [turn("user", user[1] + REACTION_HINT) if req.script_mode else user], cancelled, req.llm or None,
+                                        SCRIPT_SYSTEM_PROMPT if req.script_mode else None)
                     try:
                         for piece in stream:
                             if cancelled():
@@ -1256,6 +1278,133 @@ def api_chat_stream(req: StreamRequest):
             done.set()
 
     return StreamingResponse(events(), media_type="application/x-ndjson")
+
+
+# ---------------- fixed story script ----------------
+# script.json: blocks of 3-5 story segments (each followed by a slot where the listener may give aizuchi) and one question.
+# The story text is spoken as written (never touched by the LLM); the LLM only reacts to the answer to a question,
+# or answers an interjection. Every AI line in the log has source = "script" | "llm" | "filler" | "fallback".
+SCRIPT_PATH = HERE / "script.json"
+# While a script runs, the LLM must not tell its own story (it once invented a Paris trip right before the scripted Italy story).
+SCRIPT_SYSTEM_PROMPT = """\
+あなたは「あおい」、25歳の女性です。今は相手に自分の旅行の話をしている途中です。
+あなたの話の内容はすべて台本で決まっています。あなたが自分で旅行の体験を作って話してはいけません。
+相手が話したことに、一文だけ、短く自然な相づちや感想を返してください。です・ます調で話してください。
+新しい話題や質問は出さないでください。相手の言葉を繰り返さないでください。
+"""
+REACTION_HINT = "（一文だけ、短く自然に相づちや感想を返してください。質問や新しい話題は出さないでください。）"
+script_data: dict = {"blocks": [], "warnings": [], "error": None}
+
+
+CUE_SPLIT = re.compile(r"\s*\|([SsWw])\s*")
+
+
+def parse_cues(text: str) -> list[tuple[str, str | None]] | None:
+    """'A、|W B。|S' -> [('A、','W'), ('B。','S')]; None if the text has no |S / |W markers (the plain phrase rules apply).
+    Text after the last marker counts as a strong cue. A leading '(handoff)' is ignored."""
+    text = re.sub(r"^\s*\(handoff\)\s*", "", text)
+    if not CUE_SPLIT.search(text):
+        return None
+    parts = CUE_SPLIT.split(text)  # [chunk, cue, chunk, cue, ..., rest]
+    out = [(parts[i].strip(), parts[i + 1].upper()) for i in range(0, len(parts) - 1, 2) if parts[i].strip()]
+    if parts[-1].strip():
+        out.append((parts[-1].strip(), "S"))
+    return out
+
+
+def load_script() -> dict:
+    global script_data
+    try:
+        raw = json.loads(SCRIPT_PATH.read_text(encoding="utf-8"))
+        blocks, warnings = [], []
+        for i, b in enumerate(raw.get("blocks", [])):
+            segs = [x.strip() for x in b.get("segments", []) if x and x.strip()]
+            q = (b.get("question") or "").strip()
+            bid = b.get("id", f"block{i + 1}")
+            marked = [parse_cues(x) for x in segs]
+            slots = sum(1 for m in marked if m for _, c in m if c == "S") if any(marked) else len(segs)
+            if b.get("check_slots", True) and not 3 <= slots <= 5:
+                warnings.append(f"block {bid!r} has {slots} aizuchi slots ({'strong |S cues' if any(marked) else 'segments'}; 3-5 expected)")
+            units = [{"kind": "story", "text": x} for x in segs] + ([{"kind": "question", "text": q}] if q else [])
+            blocks.append({"id": bid, "units": units})
+        if (raw.get("outro") or "").strip():
+            blocks.append({"id": "outro", "units": [{"kind": "outro", "text": raw["outro"].strip()}]})
+        script_data = {"blocks": blocks, "warnings": warnings, "error": None}
+    except Exception as e:
+        script_data = {"blocks": [], "warnings": [], "error": repr(e)}
+    return script_data
+
+
+load_script()
+
+
+def add_assistant_history(text: str):
+    """Script lines go into the LLM's conversation history; consecutive assistant lines are merged (roles must alternate)."""
+    if not history:
+        history.append(turn("user", "（会話開始）"))
+    if history[-1][0] == "assistant":
+        history[-1] = turn("assistant", history[-1][1] + text)
+    else:
+        history.append(turn("assistant", text))
+
+
+@app.get("/api/script")
+def api_script():
+    return script_data
+
+
+@app.post("/api/script/reload")
+def api_script_reload():
+    return load_script()
+
+
+class ScriptUnitRequest(TTSRequest):
+    text: str = ""  # unused (inherited): the text comes from script.json
+    block: int
+    unit: int
+
+
+@app.post("/api/script/unit")
+def api_script_unit(req: ScriptUnitRequest):
+    """Speak one unit (a story segment, a question, or the outro) of the script: phrase chunks, each its own clip, NDJSON like chat_stream."""
+    try:
+        unit = script_data["blocks"][req.block]["units"][req.unit]
+    except (IndexError, KeyError):
+        raise HTTPException(404, "no such script unit")
+    cues = parse_cues(unit["text"])
+    plain = re.sub(r"^\s*\(handoff\)\s*", "", unit["text"])  # a "(handoff)" label in the script is never spoken
+    chunks = cues if cues is not None else [(c, None) for c in split_chunks(plain, SENTENCE_END)]
+    block_id = script_data["blocks"][req.block]["id"]
+    my_turn = turn_no  # a barge-in (/api/interrupt) or a newer chat request bumps turn_no and stops this unit
+
+    def events():
+        spoken = []
+        for i, (c, cue) in enumerate(chunks):
+            if my_turn != turn_no:
+                return
+            d = tail_stretcher.decide_cue(cue, req.stretch_table, req.stretch_jitter) if cue else tail_stretcher.decide(c, req.stretch_table, req.stretch_jitter)
+            audio = synth(req.model_copy(update={"text": c}), stretch=d[1] if d else None)
+            clip_id = log_audio("ai", audio)
+            log_chat("ai", c, clip_id, source="script", script_block=block_id, script_unit=req.unit, script_kind=unit["kind"], chunk=i, cue=cue,
+                     stretch_kind=d[0] if d else None, stretch_factor=d[1] if d else None)
+            spoken.append(c)
+            yield json.dumps({"text": c, "audio": base64.b64encode(audio).decode(), "id": clip_id, "unit": req.unit,
+                              "kind": unit["kind"], "cue": cue, "last": i == len(chunks) - 1}) + "\n"
+        if spoken and my_turn == turn_no:
+            add_assistant_history("".join(spoken))
+
+    return StreamingResponse(events(), media_type="application/x-ndjson")
+
+
+class ScriptEvent(BaseModel):
+    text: str
+    block: int | None = None
+
+
+@app.post("/api/script/event")
+def api_script_event(ev: ScriptEvent):
+    log_chat("event", ev.text, source="script", script_block=script_data["blocks"][ev.block]["id"] if ev.block is not None and 0 <= ev.block < len(script_data["blocks"]) else None)
+    return {"ok": True}
 
 
 @app.post("/api/reset")

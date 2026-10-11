@@ -27,6 +27,9 @@
   .msg { padding:8px 12px; border-radius:10px; max-width:85%; white-space:pre-wrap; }
   .msg.user { background:var(--user); justify-self:end; }
   .msg.bot { background:var(--bot); justify-self:start; }
+  .msg.script::before, .msg.llm::before { display:block; font-size:10px; font-weight:700; letter-spacing:.04em; opacity:.6; }
+  .msg.script::before { content:"SCRIPT"; }
+  .msg.llm::before { content:"LLM"; }
   .msg.backchannel { background:var(--user); justify-self:end; opacity:.55; font-style:italic; }
   #state { display:flex; align-items:center; gap:14px; padding:14px 18px; border-radius:12px; color:#fff; background:var(--c); transition:background .2s; }
   #state .dot { width:18px; height:18px; border-radius:50%; background:#fff; flex:none; }
@@ -66,7 +69,8 @@
   <h1>Voice Chat — anime-whisper → LLM → Style-Bert-VITS2</h1>
 
   <div class="tabs">
-    <button id="tab-chat" class="active">Chat</button>
+    <button id="tab-chat" class="active">Conversation</button>
+    <button id="tab-script">Script conversation</button>
     <button id="tab-debug">Debug</button>
   </div>
 
@@ -102,6 +106,14 @@
       <progress id="lvl" max="0.1" value="0" style="width:140px"></progress>
     </label>
     <button id="reset">Reset chat</button>
+  </section>
+
+  <section class="card row" id="script-card" hidden>
+    <button id="script-restart">↻ Restart script from block 1</button>
+    <label>Wait for an answer (s)
+      <input id="script-wait" type="number" min="3" max="60" step="1" value="12" style="width:80px">
+    </label>
+    <span id="script-status" style="color:var(--muted);font-size:13px">Press “Start conversation”: the script starts by itself (script.json: story blocks with a question between them)</span>
   </section>
 
   <section class="card"><div id="log"></div></section>
@@ -329,7 +341,7 @@ function unlockAudio() {
 // While the mic recording runs, the real start/stop time of each clip is reported (on the recording's clock)
 // so the server can build an AI track with the same timeline as the human recording.
 const queue = []; let playing = false, idleWaiters = [], cur = null;
-function enqueue(url, id, filler = false, text = "") { queue.push({ url, id, filler, text }); if (!playing) playNext(); }
+function enqueue(url, id, filler = false, text = "", meta = null) { queue.push({ url, id, filler, text, meta }); if (!playing) playNext(); }
 function reportClip(completed) {
   const c = cur; cur = null;
   if (!c || c.start == null || !listening) return;  // never actually heard, or no mic timeline
@@ -347,7 +359,7 @@ $("player").onplaying = () => {
   }
 };
 // Silence between sentences = the page's pause + about 0.15 s left at the clip edges (the voice's own ~0.4 s padding is trimmed).
-let PAUSE_MS = 300, PAUSE_END_MS = 850, playEpoch = 0, lastPlayedText = "";  // aizuchi slots: after a phrase 300-500 ms, after a sentence longer (+~130 ms clip edges)
+let PAUSE_MS = 300, PAUSE_END_MS = 850, playEpoch = 0, lastPlayedText = "", lastPlayedCue = "";  // aizuchi slots: after a phrase 300-500 ms, after a sentence longer (+~130 ms clip edges)
 try { const v = localStorage.getItem("pause_ms"); if (v !== null) PAUSE_MS = Math.min(500, Math.max(300, +v)); } catch (e) {}
 try { const v = localStorage.getItem("pause_end_ms"); if (v !== null) PAUSE_END_MS = Math.min(1500, Math.max(300, +v)); } catch (e) {}
 const pauseAfter = text => /[。！？!?]\s*$/.test(text || "") ? PAUSE_END_MS : PAUSE_MS;  // sentence end = a longer turn-taking slot
@@ -356,13 +368,14 @@ async function playNext(fromEnded = false) {
   const item = queue.shift();
   if (!item) { playing = false; idleWaiters.splice(0).forEach(f => f()); return; }
   playing = true;
-  const gap = pauseAfter(lastPlayedText);
+  const gap = lastPlayedCue ? (lastPlayedCue === "S" ? PAUSE_END_MS : PAUSE_MS) : pauseAfter(lastPlayedText);  // script phrases: |S = long slot, |W = short
   if (fromEnded && gap > 0) {  // between two clips of the same reply (never before the first one)
     const e = playEpoch;
     await new Promise(r => setTimeout(r, gap));
     if (e !== playEpoch) return;    // you interrupted during the pause
   }
-  cur = { id: item.id, start: null, filler: item.filler }; lastPlayedText = item.text;
+  cur = { id: item.id, start: null, filler: item.filler, meta: item.meta }; lastPlayedText = item.text; lastPlayedCue = (item.meta && item.meta.cue) || "";
+  if (item.meta && item.meta.script) script.playingUnit = item.meta.unit;  // which script unit is being heard (for resuming after an interruption)
   $("player").src = item.url; $("player").onended = () => playNext(true);
   try { await $("player").play(); }
   catch (e) {
@@ -387,6 +400,7 @@ const idleStatus = () => listening ? "Listening…" : "";
 // Stop the bot: abort the running reply, drop queued audio, tell the server.
 function bargeIn() {
   epoch++;  // drops any filler that is still being fetched
+  scriptOnBarge();
   cancelSpec();
   if (chatCtrl) { chatCtrl.abort(); chatCtrl = null; }
   stopPlayback();
@@ -400,7 +414,7 @@ function startStream(text, speculative, cont = false) {
   s.promise = (async () => {
     const r = await api("/api/chat_stream", {
       method: "POST", headers: {"Content-Type": "application/json"}, signal: s.ctrl.signal,
-      body: JSON.stringify({ text, speculative, cont, spec_id: s.id, llm: $("llm").value, test: $("dbg-test").checked, model: $("model").value,
+      body: JSON.stringify({ text, speculative, cont, script_mode: script.on, spec_id: s.id, llm: $("llm").value, test: $("dbg-test").checked, model: $("model").value,
                              style: $("style").value, style_weight: +$("sw").value, length: +$("len").value, stretch_table: STRETCH_TABLE, stretch_jitter: STRETCH_JITTER }),
     });
     const reader = r.body.getReader(), dec = new TextDecoder();
@@ -428,7 +442,7 @@ function onStreamLine(s, line) {
 function deliver(s, { text, audio, id }) {
   botSpoke = true;
   if (!s.got) { s.got = true; unanswered.splice(0, s.texts.length); }  // answered (at least partly)
-  if (!s.bubble) { addMsg("bot", ""); s.bubble = $("log").lastChild; }
+  if (!s.bubble) { addMsg("bot llm", ""); s.bubble = $("log").lastChild; }
   s.bubble.textContent += text; $("log").scrollTop = $("log").scrollHeight;
   enqueue(URL.createObjectURL(new Blob([Uint8Array.from(atob(audio), c => c.charCodeAt(0))], { type: "audio/wav" })), id, false, text);
   setStatus("Speaking…");
@@ -455,6 +469,7 @@ async function chatTurn(cont = false) {
     s = startStream(text, false, cont);
   }
   chatCtrl = s.ctrl;
+  if (script.on && script.phase === "question") { script.phase = "reaction"; scriptStatus(`block ${script.block + 1}: reacting to your answer`); }
   setStatus(s.got ? "Speaking…" : "Thinking…");
   let failed = false;
   try {
@@ -469,6 +484,7 @@ async function chatTurn(cont = false) {
     if (chatCtrl === s.ctrl) chatCtrl = null;
     if (failed) setTimeout(() => { if ($("status").textContent.startsWith("Error")) setStatus(idleStatus()); }, 10000);  // keep the error visible
     else if (!s.ctrl.signal.aborted) setStatus(idleStatus());
+    if (script.on && !failed && !s.ctrl.signal.aborted) scriptAfterReply();
   }
 }
 
@@ -585,6 +601,7 @@ let lastFiller = 0, epoch = 0;
 let turnEndAt = null, turnSpeech = 0, earlyUsed = false;  // end-to-end latency of the last normal turn
 let CONT_ON = true, CONT_AFTER = 5, CONT_MAX = 2, contCount = 0, botSpoke = false, silentSince = null;
 function silenceTick() {
+  if (script.on) { scriptTick(); return; }  // a script is running: the silence-breaking LLM turn is off
   const busy = !listening || chatCtrl || playing || queue.length || asrPending > 0 || vad.state === "speech" || unanswered.length || spec || !botSpoke;
   if (busy) { silentSince = null; return; }
   if (silentSince == null) { silentSince = Date.now(); return; }  // the clock starts when everything went quiet
@@ -642,7 +659,7 @@ function onFrame(f) {
       vad.pre = []; vad.preT = 0;
       vad.fillerSent = false; vad.specSent = false; vad.bargeAt = BARGE_AFTER; vad.bargeChecking = false;
       vad.startSample = rec.total - vad.utt.reduce((a, x) => a + x.length, 0);  // where this utterance starts in the full recording
-      vad.overBot = !!chatCtrl;              // bot is generating / speaking: don't interrupt yet
+      vad.overBot = !!chatCtrl || scriptBusy();   // bot is generating / speaking (or reading the script): don't interrupt yet
       dbg(`speech start — bot ${vad.overBot ? "BUSY → holding (possible backchannel)" : "idle → normal turn"}`);
       if (vad.overBot) setStatus("Speaking… (hearing you)"); else { bargeIn(); setStatus("Listening to you…"); }
     }
@@ -674,7 +691,7 @@ function onFrame(f) {
   if (vad.quiet >= END_AFTER || vad.uttT >= MAX_UTT) {
     const speech = vad.uttT - vad.quiet, frames = vad.utt, sr = micCtx.sampleRate, offset = vad.startSample / sr;
     // Short speech while the bot is still talking = backchannel: transcribe and show it, but don't reply.
-    const backchannel = vad.overBot && !!chatCtrl;
+    const backchannel = vad.overBot && (!!chatCtrl || scriptBusy());
     dbg(`speech end — ${speech.toFixed(2)}s → ` + (backchannel ? "BACKCHANNEL" : speech >= MIN_SPEECH
       ? (vad.overBot ? "normal turn (bot finished meanwhile)" : "normal turn") : `discarded (noise, < ${MIN_SPEECH}s)`), backchannel ? "bc" : "");
     Object.assign(vad, { state: "idle", utt: [], uttT: 0, loud: 0, quiet: 0, overBot: false, fillerSent: false, specSent: false });
@@ -734,8 +751,9 @@ function stopListening() {
 $("mic").onclick = async () => {
   unlockAudio();
   try {
-    if (listening) { bargeIn(); listening = false; $("llm").disabled = false; $("llm-note").textContent = ""; stopListening(); $("mic").textContent = "🎙 Start conversation"; $("mic").className = "primary"; setStatus(""); }
-    else { await startListening(); listening = true; $("llm").disabled = true; $("llm-note").textContent = "(locked during conversation)"; $("mic").textContent = "⏹ Stop conversation"; $("mic").className = "rec"; setStatus("Listening…"); }
+    if (listening) { scriptStop("conversation stopped"); bargeIn(); listening = false; $("llm").disabled = false; $("llm-note").textContent = ""; stopListening(); $("mic").textContent = "🎙 Start conversation"; $("mic").className = "primary"; setStatus(""); }
+    else { await startListening(); listening = true; $("llm").disabled = true; $("llm-note").textContent = "(locked during conversation)"; $("mic").textContent = "⏹ Stop conversation"; $("mic").className = "rec"; setStatus("Listening…");
+      if (convMode === "script") scriptBegin(); }  // the Script tab starts its script by itself
   } catch (e) { setStatus("Mic error: " + e.message); }
 };
 
@@ -786,6 +804,107 @@ $("bench-run").onclick = async () => {
   } catch (e) { $("bench-status").textContent = "failed: " + e.message; }
   finally { $("bench-run").disabled = false; }
 };
+// ---------- fixed story script (script.json) ----------
+// A block = story units (each followed by a slot for aizuchi) + a question. The story is spoken as written; the LLM only
+// reacts to the answer to a question, or answers an interjection, after which the script carries on.
+const script = { on: false, blocks: [], block: 0, unit: 0, phase: "idle", epoch: 0, playingUnit: -1, ctrl: null, answerWait: 12 };
+const scriptBusy = () => script.on && script.phase === "playing";  // reading story units: speech over it is an aizuchi unless it lasts
+const scriptStatus = t => { $("script-status").textContent = t; };
+const scriptEvent = (text, block = script.block) => fetch("/api/script/event", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ text, block }) }).catch(() => {});
+function scriptStop(why) {
+  if (!script.on && script.phase === "idle") return;
+  script.on = false; script.phase = "idle"; script.epoch++; if (script.ctrl) script.ctrl.abort();
+  scriptStatus(why || "stopped");
+}
+$("script-wait").onchange = () => script.answerWait = +$("script-wait").value;
+async function scriptBegin() {  // called when the conversation starts in the Script tab (or on Restart)
+  try {
+    const d = await (await api("/api/script/reload", { method: "POST" })).json();
+    if (d.error || !d.blocks.length) { scriptStatus("script.json: " + (d.error || "no blocks")); return; }
+    d.warnings.forEach(w => dbg("script: " + w, "warn"));
+    script.blocks = d.blocks; script.answerWait = +$("script-wait").value;
+    Object.assign(script, { on: true, block: 0, unit: 0, playingUnit: -1 });
+    unanswered.length = 0; botSpoke = true; contCount = 0;
+    scriptEvent("script started"); scriptPlay();
+  } catch (e) { scriptStatus("failed: " + e.message); }
+}
+$("script-restart").onclick = () => { unlockAudio(); bargeIn(); scriptStop("restarting"); scriptEvent("script restarted"); scriptBegin(); };
+
+async function scriptFetchUnit(blk, u, my) {
+  const ctrl = script.ctrl = new AbortController();
+  const r = await api("/api/script/unit", {
+    method: "POST", headers: {"Content-Type": "application/json"}, signal: ctrl.signal,
+    body: JSON.stringify({ block: script.block, unit: u, model: $("model").value, style: $("style").value, style_weight: +$("sw").value,
+                           length: +$("len").value, stretch_table: STRETCH_TABLE, stretch_jitter: STRETCH_JITTER }),
+  });
+  const reader = r.body.getReader(), dec = new TextDecoder(); let buf = "", bubble = null;
+  const take = line => {
+    if (!line.trim() || script.epoch !== my) return;
+    const m = JSON.parse(line);
+    if (!bubble) { addMsg("bot script", ""); bubble = $("log").lastChild; }
+    bubble.textContent += m.text; $("log").scrollTop = $("log").scrollHeight;
+    enqueue(URL.createObjectURL(new Blob([Uint8Array.from(atob(m.audio), c => c.charCodeAt(0))], { type: "audio/wav" })), m.id, false, m.text, { script: true, unit: m.unit, kind: m.kind, cue: m.cue });
+    botSpoke = true; setStatus("Speaking…");
+  };
+  for (;;) {
+    const { done, value } = await reader.read(); if (done) break;
+    buf += dec.decode(value, { stream: true }); const lines = buf.split("\n"); buf = lines.pop(); lines.forEach(take);
+  }
+  take(buf);
+}
+async function scriptPlay() {
+  const my = ++script.epoch; script.phase = "playing";
+  const blk = script.blocks[script.block];
+  if (!blk) { scriptStop("script finished"); return; }
+  scriptStatus(`block ${script.block + 1}/${script.blocks.length} (${blk.id}): unit ${script.unit + 1}/${blk.units.length}`);
+  if (script.unit === 0) scriptEvent(`block started: ${blk.id}`);
+  try {
+    while (script.unit < blk.units.length && script.epoch === my) {  // the next unit is fetched while the previous one plays
+      const u = script.unit++;
+      await scriptFetchUnit(blk, u, my);
+      if (script.epoch === my) scriptStatus(`block ${script.block + 1}/${script.blocks.length} (${blk.id}): unit ${Math.min(script.unit + 1, blk.units.length)}/${blk.units.length}`);
+    }
+    if (script.epoch !== my) return;
+    await whenIdle();                  // everything has been spoken
+    if (script.epoch !== my) return;
+    const last = blk.units[blk.units.length - 1];
+    if (last.kind === "question") { script.phase = "question"; scriptStatus(`block ${script.block + 1}: waiting for your answer`); scriptEvent(`question asked, waiting up to ${script.answerWait}s`); }
+    else scriptNext();
+  } catch (e) { if (e.name !== "AbortError") { dbg("script failed: " + e.message, "warn"); scriptStatus("failed: " + e.message); } }
+}
+function scriptNext(why) {
+  if (!script.on) return;
+  script.phase = "between"; script.block++; script.unit = 0; script.playingUnit = -1;
+  if (script.block >= script.blocks.length) { scriptEvent("script finished"); scriptStop("script finished"); return; }
+  if (why) { dbg("script: " + why, "bc"); scriptEvent(why, script.block - 1); }
+  const my = script.epoch;
+  setTimeout(() => { if (script.on && script.phase === "between" && script.epoch === my && !chatCtrl) scriptPlay(); }, 600);
+}
+// You interrupted (a real word, not an aizuchi): the story units still queued are dropped; the LLM answers; then the script resumes.
+function scriptOnBarge() {
+  if (!script.on) return;
+  script.epoch++; if (script.ctrl) script.ctrl.abort();
+  if (script.phase === "playing") {
+    const blk = script.blocks[script.block], qIdx = blk && blk.units[blk.units.length - 1].kind === "question" ? blk.units.length - 1 : -1;
+    if (qIdx >= 0 && script.playingUnit >= qIdx) { script.phase = "question"; }   // cut in while the question was being asked: that is the answer
+    else script.unit = script.playingUnit + 1;                                       // resume after the unit that was being heard
+    scriptEvent(`interrupted in phase ${script.phase === "question" ? "question" : "story"}; ${script.phase === "question" ? "the speech is the answer" : "resumes at unit " + (script.unit + 1)}`);
+  }
+}
+// The LLM finished answering: carry on with the script.
+function scriptAfterReply() {
+  if (script.phase === "question" || script.phase === "reaction") scriptNext();
+  else if (script.phase === "playing") { scriptEvent("resuming the block after an interjection"); scriptPlay(); }
+}
+// Runs every 250 ms while a script is on: no answer to a question within the wait = move on to the next block.
+function scriptTick() {
+  if (script.phase !== "question") { silentSince = null; return; }
+  const busy = !listening || chatCtrl || playing || queue.length || asrPending > 0 || vad.state === "speech" || unanswered.length || spec;
+  if (busy) { silentSince = null; return; }
+  if (silentSince == null) { silentSince = Date.now(); return; }
+  if (Date.now() - silentSince >= script.answerWait * 1000) { silentSince = null; scriptNext(`no answer within ${script.answerWait}s, next block`); }
+}
+
 // ---------- ASR comparison ----------
 const asrState = { clips: [], models: [], results: {} };  // results[rel][model] = { text, ms }
 const asrNorm = s => String(s || "").replace(/[\s。、，．,.！？!?「」『』（）()…〜~・]/g, "");
@@ -1014,12 +1133,25 @@ function showDebugGroup(g) {
 document.querySelectorAll("#dsubtabs button").forEach(b => b.onclick = () => showDebugGroup(b.dataset.d));
 { let g = "live"; try { g = localStorage.getItem("dbg_group") || "live"; } catch (e) {} showDebugGroup(["live", "cues", "bc", "asr", "llm"].includes(g) ? g : "live"); }
 
-function showTab(name) {
-  $("view-chat").hidden = name !== "chat"; $("view-debug").hidden = name !== "debug";
-  $("tab-chat").classList.toggle("active", name === "chat"); $("tab-debug").classList.toggle("active", name === "debug");
+// Two conversation modes share the chat view: "chat" (LLM only) and "script" (fixed story from script.json).
+// Switching between them stops the running conversation and starts a fresh log session, so each log belongs to one mode.
+let convMode = "chat";
+async function showTab(name) {
+  const conv = name === "chat" || name === "script";
+  if (conv && name !== convMode) {
+    if (listening) $("mic").click();   // stop the running conversation (also stops the script)
+    scriptStop("mode changed");
+    convMode = name;
+    await $("reset").onclick();        // new log session for the other mode
+    setStatus(name === "script" ? "Script conversation: press “Start conversation”, the script starts by itself." : "");
+  }
+  $("view-chat").hidden = !conv; $("view-debug").hidden = name !== "debug";
+  $("script-card").hidden = convMode !== "script" || !conv;
+  $("tab-chat").classList.toggle("active", name === "chat"); $("tab-script").classList.toggle("active", name === "script");
+  $("tab-debug").classList.toggle("active", name === "debug");
   if (name === "debug") refreshDebug();
 }
-$("tab-chat").onclick = () => showTab("chat"); $("tab-debug").onclick = () => showTab("debug");
+$("tab-chat").onclick = () => showTab("chat"); $("tab-script").onclick = () => showTab("script"); $("tab-debug").onclick = () => showTab("debug");
 
 function renderLive() {
   const kv = (k, v) => `<div><b>${k}</b>${v}</div>`;
@@ -1039,7 +1171,7 @@ async function refreshDebug() {
     $("dbg-sess").textContent = `— ${d.session}` + (d.pending_writes ? ` (${d.pending_writes} writes pending)` : "");
     $("dbg-count").textContent = `${d.entries.length} entries: ${n("user")} user, ${n("backchannel")} backchannel, ${n("ai")} ai, ${n("event")} events`;
     const rows = d.entries.filter(e => !only || e.role === "backchannel").reverse().map(e =>
-      `<tr><td>${e.time.slice(11, 23)}</td><td><span class="role ${e.role}">${e.role}</span></td><td>${esc(e.text)}</td>` +
+      `<tr><td>${e.time.slice(11, 23)}</td><td><span class="role ${e.role}">${e.role}</span>${e.source ? `<div style="font-size:10px;color:var(--muted)">${e.source}</div>` : ""}</td><td>${esc(e.text)}</td>` +
       `<td>${e.audio ? `<audio controls preload="none" src="/api/debug/audio/${e.audio.replace(/^audio\//, "")}" style="height:28px"></audio>` : ""}` +
       (e.full_audio ? `<div style="font-size:11px;color:var(--muted)">${e.full_audio.replace(/^audio\//, "")} @ ${e.full_offset_s}s</div>` : "") + `</td></tr>`
     ).join("");
@@ -1054,8 +1186,10 @@ $("reset").onclick = async () => {
   bargeIn(); unanswered = [];
   flushRec(); await rec.chain;  // finish the old session's recording first
   await api("/api/reset", { method: "POST" });
-  botSpoke = false; contCount = 0; silentSince = null;
-  Object.assign(rec, { buf: [], n: 0, total: 0, start: true });  // new session = new full recording $("log").innerHTML = ""; setStatus("Chat reset.");
+  botSpoke = false; contCount = 0; silentSince = null; scriptStop("chat reset");
+  Object.assign(rec, { buf: [], n: 0, total: 0, start: true });  // new session = new full recording
+  $("log").innerHTML = ""; setStatus("Chat reset.");
+  if (convMode === "script" && listening) scriptBegin();  // resetting inside a running script conversation starts the script over
 };
 
 api("/api/session?kind=normal", { method: "POST" }).catch(() => {});  // page load = normal mode (checkbox is unticked)
