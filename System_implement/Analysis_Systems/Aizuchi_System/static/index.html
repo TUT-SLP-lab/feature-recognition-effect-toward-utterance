@@ -50,6 +50,11 @@
   .subtabs button.active { color:var(--accent); border-bottom-color:var(--accent); background:var(--card); }
   [data-dsub] > h2:first-child, [data-dsub] > .row > h2:first-child { font-size:15px !important; padding-bottom:6px; border-bottom:1px solid #e5e7eb; }
   [data-dsub] { margin-bottom:14px; }
+  #pv { position:fixed; inset:0; z-index:1000; background:#04070d; display:flex; align-items:center; justify-content:center; }
+  #pv.idle { cursor:none; }
+  #pv canvas { width:min(100vw,100vh); height:min(100vw,100vh); }
+  #pv button { position:absolute; bottom:9vh; padding:12px 34px; font-size:16px; letter-spacing:.2em; color:#7fb8e0; background:transparent; border:1px solid #2a4a66; border-radius:999px; cursor:pointer; }
+  #pv button:hover { background:#0c1a28; }
   .tabs { display:flex; gap:6px; }
   .tabs button.active { background:var(--accent); color:#fff; border-color:transparent; }
   .kv { display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:6px 14px; font-size:13px; }
@@ -72,6 +77,7 @@
     <button id="tab-chat" class="active">Conversation</button>
     <button id="tab-script">Script conversation</button>
     <button id="tab-debug">Debug</button>
+    <button id="pv-open" style="margin-left:auto" title="Full-screen view for participants: a circle that reacts to the system's voice, no text. Esc to leave.">Participant view</button>
   </div>
 
   <div id="state" data-s="off"><span class="dot"></span><div><div class="label">Mic off</div><div class="sub">Press “Start conversation”</div></div></div>
@@ -282,6 +288,10 @@
   </section>
 </main>
 
+<div id="pv" hidden>
+  <canvas id="pv-canvas"></canvas>
+  <button id="pv-start">開始</button>
+</div>
 <script>
 const $ = id => document.getElementById(id);
 let models = [];
@@ -807,6 +817,64 @@ $("bench-run").onclick = async () => {
   } catch (e) { $("bench-status").textContent = "failed: " + e.message; }
   finally { $("bench-run").disabled = false; }
 };
+// ---------- participant view: a circle that follows the system's voice, no text ----------
+// It reacts to the loudness of the audio the page plays (the system's voice) and to nothing else: not your voice, not the
+// conversation state. The ring rotation and the idle breathing are constant, so it never signals a slot or a turn.
+let pvAudio = null, pvSm = 0, pvRaf = 0, pvIdleTimer = 0;
+function pvAudioInit() {
+  if (pvAudio) { pvAudio.ctx.resume(); return; }
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const src = ctx.createMediaElementSource($("player"));  // the same <audio> element that plays every clip
+  const an = ctx.createAnalyser(); an.fftSize = 1024; an.smoothingTimeConstant = 0;
+  src.connect(an); an.connect(ctx.destination);
+  pvAudio = { ctx, an, data: new Uint8Array(an.fftSize) };
+}
+function pvLevel() {
+  if (!pvAudio) return 0;
+  pvAudio.an.getByteTimeDomainData(pvAudio.data);
+  let s = 0; for (const v of pvAudio.data) { const x = (v - 128) / 128; s += x * x; }
+  return Math.sqrt(s / pvAudio.data.length);
+}
+function pvFrame(t) {
+  if ($("pv").hidden) return;
+  const c = $("pv-canvas"), size = Math.round(c.clientWidth * (window.devicePixelRatio || 1));
+  if (c.width !== size) c.width = c.height = size;
+  const g = c.getContext("2d"), R = size / 2, T = t / 1000;
+  const lv = Math.min(1, pvLevel() * 4);
+  pvSm += (lv - pvSm) * (lv > pvSm ? 0.35 : 0.08);                 // quick to rise, slow to fall
+  const breathe = 1 + 0.025 * Math.sin(T * 2 * Math.PI * 0.22);   // constant idle breathing
+  const core = R * 0.2 * breathe * (1 + 0.6 * pvSm);
+  g.clearRect(0, 0, size, size);
+  const glow = g.createRadialGradient(R, R, core * 0.2, R, R, core * 3.4);
+  glow.addColorStop(0, `rgba(120,215,255,${0.5 + 0.35 * pvSm})`);
+  glow.addColorStop(0.4, `rgba(40,130,210,${0.16 + 0.2 * pvSm})`);
+  glow.addColorStop(1, "rgba(0,40,90,0)");
+  g.fillStyle = glow; g.beginPath(); g.arc(R, R, core * 3.4, 0, 6.2832); g.fill();
+  g.fillStyle = `rgba(190,238,255,${0.72 + 0.28 * pvSm})`; g.beginPath(); g.arc(R, R, core, 0, 6.2832); g.fill();
+  // thin rings: constant slow rotation; only their radius follows the voice
+  [[0.42, [3, 16], 0.04, 0.5], [0.56, [46, 20], -0.025, 0.4], [0.70, [8, 34], 0.015, 0.3]].forEach(([r, dash, speed, a], i) => {
+    g.save(); g.translate(R, R); g.rotate(T * speed * 6.2832 + i * 1.7);
+    g.strokeStyle = `rgba(110,195,255,${a})`; g.lineWidth = Math.max(1, size / 500);
+    g.setLineDash(dash.map(d => d * size / 1000)); g.beginPath(); g.arc(0, 0, r * R * (1 + 0.05 * pvSm), 0, 6.2832); g.stroke(); g.restore();
+  });
+  pvRaf = requestAnimationFrame(pvFrame);
+}
+function pvOpen() {
+  unlockAudio(); pvAudioInit();
+  $("pv").hidden = false; $("pv-start").hidden = listening;
+  try { document.documentElement.requestFullscreen && document.documentElement.requestFullscreen().catch(() => {}); } catch (e) {}
+  cancelAnimationFrame(pvRaf); pvRaf = requestAnimationFrame(pvFrame);
+}
+function pvClose() {
+  $("pv").hidden = true; cancelAnimationFrame(pvRaf);
+  try { if (document.fullscreenElement) document.exitFullscreen().catch(() => {}); } catch (e) {}
+}
+$("pv-open").onclick = pvOpen;
+$("pv-start").onclick = () => { $("mic").click(); $("pv-start").hidden = true; };   // the conversation (and, in the Script tab, the script) starts
+document.addEventListener("keydown", e => { if (e.key === "Escape" && !$("pv").hidden) pvClose(); });
+document.addEventListener("fullscreenchange", () => { if (!document.fullscreenElement && !$("pv").hidden) pvClose(); });
+$("pv").addEventListener("mousemove", () => { $("pv").classList.remove("idle"); clearTimeout(pvIdleTimer); pvIdleTimer = setTimeout(() => $("pv").classList.add("idle"), 2000); });
+
 // ---------- fixed story script (files in the scripts folder) ----------
 // A block = story units (each followed by a slot for aizuchi) + a question. The story is spoken as written; the LLM only
 // reacts to the answer to a question, or answers an interjection, after which the script carries on.
