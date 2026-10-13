@@ -1,4 +1,5 @@
 {
+  "title": "Italy trip (Rome, gelato, Naples)",
   "_note": "Markers: |S = strong cue (long slot, strong lengthening), |W = weak cue (short pause, weak lengthening); they are never spoken. 'question' is the handoff after a block. The opener block has check_slots=false: exclude block id 'opener' from aizuchi analysis.",
   "blocks": [
     {

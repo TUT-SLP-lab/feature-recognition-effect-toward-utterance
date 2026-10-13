@@ -1,10 +1,10 @@
 """
 Simple cascaded voice chat: mic -> anime-whisper (ASR) -> Gemini 3.5 Flash Lite/Genma 4 12B (LLM) -> Style-Bert-VITS2 (TTS).
 
-Run:  GENAI_API_KEY=... python simple_system.py   (then open http://localhost:8000)
+Run:  GENAI_API_KEY=... python aizuchi_system.py   (then open http://localhost:8000)
 LLMs: Gemini 3.5 Flash-Lite (needs GENAI_API_KEY) and local Gemma 4 12B (QAT 4-bit, served by llama.cpp); pick one in the web UI
       before starting the conversation. A model that can't load is simply greyed out.
-Uses the same dependencies as ../Voice_Chat_App/requirements.txt.
+Uses the same dependencies as ../../Voice_Chat_App/requirements.txt.
 """
 
 import asyncio
@@ -42,7 +42,7 @@ from google import genai
 from google.genai import types
 from transformers import pipeline
 
-SBV2_DIR = Path(__file__).resolve().parent.parent / "Style-Bert-VITS2"
+SBV2_DIR = Path(__file__).resolve().parents[2] / "Style-Bert-VITS2"  # System_implement/Style-Bert-VITS2 (shared by all systems)
 sys.path.insert(0, str(SBV2_DIR))  # use the local Style-Bert-VITS2 checkout
 
 from style_bert_vits2.constants import Languages  # noqa: E402
@@ -1281,10 +1281,11 @@ def api_chat_stream(req: StreamRequest):
 
 
 # ---------------- fixed story script ----------------
-# script.json: blocks of 3-5 story segments (each followed by a slot where the listener may give aizuchi) and one question.
+# scripts/*.json: blocks of 3-5 story segments (each followed by a slot where the listener may give aizuchi) and one question.
 # The story text is spoken as written (never touched by the LLM); the LLM only reacts to the answer to a question,
 # or answers an interjection. Every AI line in the log has source = "script" | "llm" | "filler" | "fallback".
-SCRIPT_PATH = HERE / "script.json"
+SCRIPTS_DIR = HERE / "scripts"  # one JSON file per script; the page picks which one to run
+DEFAULT_SCRIPT = "italy_trip.json"
 # While a script runs, the LLM must not tell its own story (it once invented a Paris trip right before the scripted Italy story).
 SCRIPT_SYSTEM_PROMPT = """\
 あなたは「あおい」、25歳の女性です。今は相手に自分の旅行の話をしている途中です。
@@ -1293,7 +1294,7 @@ SCRIPT_SYSTEM_PROMPT = """\
 新しい話題や質問は出さないでください。相手の言葉を繰り返さないでください。
 """
 REACTION_HINT = "（一文だけ、短く自然に相づちや感想を返してください。質問や新しい話題は出さないでください。）"
-script_data: dict = {"blocks": [], "warnings": [], "error": None}
+script_data: dict = {"file": None, "blocks": [], "warnings": [], "error": None}
 
 
 CUE_SPLIT = re.compile(r"\s*\|([SsWw])\s*")
@@ -1312,10 +1313,24 @@ def parse_cues(text: str) -> list[tuple[str, str | None]] | None:
     return out
 
 
-def load_script() -> dict:
+def list_scripts() -> list[dict]:
+    """[{file, title}] for every script file; title is the optional "title" field (the file name when missing or unreadable)."""
+    out = []
+    for p in sorted(SCRIPTS_DIR.glob("*.json")) if SCRIPTS_DIR.is_dir() else []:
+        try:
+            title = json.loads(p.read_text(encoding="utf-8")).get("title") or p.name
+        except Exception:
+            title = f"{p.name} (unreadable)"
+        out.append({"file": p.name, "title": title})
+    return out
+
+
+def load_script(name: str | None = None) -> dict:
+    """Load scripts/<name> (a plain file name inside the scripts folder); no name = the one loaded last, or the default."""
     global script_data
+    name = Path(name or script_data.get("file") or DEFAULT_SCRIPT).name  # .name: never a path outside the folder
     try:
-        raw = json.loads(SCRIPT_PATH.read_text(encoding="utf-8"))
+        raw = json.loads((SCRIPTS_DIR / name).read_text(encoding="utf-8"))
         blocks, warnings = [], []
         for i, b in enumerate(raw.get("blocks", [])):
             segs = [x.strip() for x in b.get("segments", []) if x and x.strip()]
@@ -1329,9 +1344,9 @@ def load_script() -> dict:
             blocks.append({"id": bid, "units": units})
         if (raw.get("outro") or "").strip():
             blocks.append({"id": "outro", "units": [{"kind": "outro", "text": raw["outro"].strip()}]})
-        script_data = {"blocks": blocks, "warnings": warnings, "error": None}
+        script_data = {"file": name, "blocks": blocks, "warnings": warnings, "error": None}
     except Exception as e:
-        script_data = {"blocks": [], "warnings": [], "error": repr(e)}
+        script_data = {"file": name, "blocks": [], "warnings": [], "error": repr(e)}
     return script_data
 
 
@@ -1348,18 +1363,24 @@ def add_assistant_history(text: str):
         history.append(turn("assistant", text))
 
 
+@app.get("/api/scripts")
+def api_scripts():
+    return {"files": list_scripts(), "current": script_data.get("file"), "default": DEFAULT_SCRIPT}
+
+
 @app.get("/api/script")
 def api_script():
     return script_data
 
 
 @app.post("/api/script/reload")
-def api_script_reload():
-    return load_script()
+def api_script_reload(name: str | None = None):
+    """(Re)read a script file from scripts/ (edits are picked up without restarting the server)."""
+    return load_script(name)
 
 
 class ScriptUnitRequest(TTSRequest):
-    text: str = ""  # unused (inherited): the text comes from script.json
+    text: str = ""  # unused (inherited): the text comes from the script file
     block: int
     unit: int
 
@@ -1385,7 +1406,7 @@ def api_script_unit(req: ScriptUnitRequest):
             d = tail_stretcher.decide_cue(cue, req.stretch_table, req.stretch_jitter) if cue else tail_stretcher.decide(c, req.stretch_table, req.stretch_jitter)
             audio = synth(req.model_copy(update={"text": c}), stretch=d[1] if d else None)
             clip_id = log_audio("ai", audio)
-            log_chat("ai", c, clip_id, source="script", script_block=block_id, script_unit=req.unit, script_kind=unit["kind"], chunk=i, cue=cue,
+            log_chat("ai", c, clip_id, source="script", script_file=script_data.get("file"), script_block=block_id, script_unit=req.unit, script_kind=unit["kind"], chunk=i, cue=cue,
                      stretch_kind=d[0] if d else None, stretch_factor=d[1] if d else None)
             spoken.append(c)
             yield json.dumps({"text": c, "audio": base64.b64encode(audio).decode(), "id": clip_id, "unit": req.unit,
@@ -1403,7 +1424,7 @@ class ScriptEvent(BaseModel):
 
 @app.post("/api/script/event")
 def api_script_event(ev: ScriptEvent):
-    log_chat("event", ev.text, source="script", script_block=script_data["blocks"][ev.block]["id"] if ev.block is not None and 0 <= ev.block < len(script_data["blocks"]) else None)
+    log_chat("event", ev.text, source="script", script_file=script_data.get("file"), script_block=script_data["blocks"][ev.block]["id"] if ev.block is not None and 0 <= ev.block < len(script_data["blocks"]) else None)
     return {"ok": True}
 
 

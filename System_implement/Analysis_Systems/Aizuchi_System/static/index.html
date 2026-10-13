@@ -109,11 +109,14 @@
   </section>
 
   <section class="card row" id="script-card" hidden>
+    <label>Topic
+      <select id="script-file"></select>
+    </label>
     <button id="script-restart">↻ Restart script from block 1</button>
     <label>Wait for an answer (s)
       <input id="script-wait" type="number" min="3" max="60" step="1" value="12" style="width:80px">
     </label>
-    <span id="script-status" style="color:var(--muted);font-size:13px">Press “Start conversation”: the script starts by itself (script.json: story blocks with a question between them)</span>
+    <span id="script-status" style="color:var(--muted);font-size:13px">Press “Start conversation”: the chosen script starts by itself (files in the scripts folder)</span>
   </section>
 
   <section class="card"><div id="log"></div></section>
@@ -804,7 +807,7 @@ $("bench-run").onclick = async () => {
   } catch (e) { $("bench-status").textContent = "failed: " + e.message; }
   finally { $("bench-run").disabled = false; }
 };
-// ---------- fixed story script (script.json) ----------
+// ---------- fixed story script (files in the scripts folder) ----------
 // A block = story units (each followed by a slot for aizuchi) + a question. The story is spoken as written; the LLM only
 // reacts to the answer to a question, or answers an interjection, after which the script carries on.
 const script = { on: false, blocks: [], block: 0, unit: 0, phase: "idle", epoch: 0, playingUnit: -1, ctrl: null, answerWait: 12 };
@@ -817,15 +820,27 @@ function scriptStop(why) {
   scriptStatus(why || "stopped");
 }
 $("script-wait").onchange = () => script.answerWait = +$("script-wait").value;
+// The script picker lists the files in the scripts folder; the choice is remembered in this browser.
+async function scriptLoadList() {
+  try {
+    const d = await (await api("/api/scripts")).json();
+    let want = $("script-file").value || d.default; try { want = localStorage.getItem("script_file") || want; } catch (e) {}
+    $("script-file").innerHTML = d.files.map(f => `<option value="${f.file}">${f.title}</option>`).join("");
+    if (d.files.some(f => f.file === want)) $("script-file").value = want;
+  } catch (e) { scriptStatus("could not list scripts: " + e.message); }
+}
+$("script-file").onchange = () => { try { localStorage.setItem("script_file", $("script-file").value); } catch (e) {} };
+scriptLoadList();
+
 async function scriptBegin() {  // called when the conversation starts in the Script tab (or on Restart)
   try {
-    const d = await (await api("/api/script/reload", { method: "POST" })).json();
-    if (d.error || !d.blocks.length) { scriptStatus("script.json: " + (d.error || "no blocks")); return; }
+    const d = await (await api("/api/script/reload?name=" + encodeURIComponent($("script-file").value || ""), { method: "POST" })).json();
+    if (d.error || !d.blocks.length) { scriptStatus((d.file || "script") + ": " + (d.error || "no blocks")); return; }
     d.warnings.forEach(w => dbg("script: " + w, "warn"));
     script.blocks = d.blocks; script.answerWait = +$("script-wait").value;
     Object.assign(script, { on: true, block: 0, unit: 0, playingUnit: -1 });
     unanswered.length = 0; botSpoke = true; contCount = 0;
-    scriptEvent("script started"); scriptPlay();
+    scriptEvent(`script started: ${d.file}`); scriptPlay();
   } catch (e) { scriptStatus("failed: " + e.message); }
 }
 $("script-restart").onclick = () => { unlockAudio(); bargeIn(); scriptStop("restarting"); scriptEvent("script restarted"); scriptBegin(); };
@@ -1133,7 +1148,7 @@ function showDebugGroup(g) {
 document.querySelectorAll("#dsubtabs button").forEach(b => b.onclick = () => showDebugGroup(b.dataset.d));
 { let g = "live"; try { g = localStorage.getItem("dbg_group") || "live"; } catch (e) {} showDebugGroup(["live", "cues", "bc", "asr", "llm"].includes(g) ? g : "live"); }
 
-// Two conversation modes share the chat view: "chat" (LLM only) and "script" (fixed story from script.json).
+// Two conversation modes share the chat view: "chat" (LLM only) and "script" (fixed story from a file in the scripts folder).
 // Switching between them stops the running conversation and starts a fresh log session, so each log belongs to one mode.
 let convMode = "chat";
 async function showTab(name) {
@@ -1147,6 +1162,7 @@ async function showTab(name) {
   }
   $("view-chat").hidden = !conv; $("view-debug").hidden = name !== "debug";
   $("script-card").hidden = convMode !== "script" || !conv;
+  if (convMode === "script" && conv) scriptLoadList();   // pick up script files added meanwhile
   $("tab-chat").classList.toggle("active", name === "chat"); $("tab-script").classList.toggle("active", name === "script");
   $("tab-debug").classList.toggle("active", name === "debug");
   if (name === "debug") refreshDebug();
