@@ -1155,7 +1155,7 @@ def api_spec_commit(id: str):
             specs.pop(id, None)
             if st["spoken"]:
                 history.extend([st["user"], turn("assistant", "".join(st["spoken"]))])
-            log_chat("event", "speculative reply committed", turn=st["turn"])
+            log_chat("event", "speculative reply committed", turn=st["turn"], spec_id=id)
     return {"ok": True}
 
 
@@ -1166,7 +1166,7 @@ def api_spec_cancel(id: str):
         st = specs.pop(id, None)
     if st and st.get("finished"):  # (a still-running generator logs this itself when it notices the interrupt)
         print(f"[speculative] discarded after {len(st['spoken'])} sentence(s)", flush=True)
-        log_chat("event", "speculative reply discarded (you kept talking)", sentences_ready=len(st["spoken"]), turn=st["turn"])
+        log_chat("event", "speculative reply discarded (you kept talking)", sentences_ready=len(st["spoken"]), turn=st["turn"], spec_id=id)
     return {"ok": True}
 
 
@@ -1247,11 +1247,13 @@ def api_chat_stream(req: StreamRequest):
                 timing["first_tts_s"] = round(time.perf_counter() - t1, 2)
             if not fallback:
                 spoken.append(sentence)
-            with spec_lock:  # while speculative and not committed, logging is parked; commit flushes it
-                hold = spec["hold"] if spec and not spec["committed"] else None
-                clip_id = log_audio("ai", audio, hold=hold)
-                log_chat("ai", sentence, clip_id, hold=hold, turn=my_turn, source="fallback" if fallback else "llm", script_mode=req.script_mode or None,
-                         stretch_kind=d[0] if d else None, stretch_factor=d[1] if d else None, **({"continued": True} if req.cont else {}), **({"fallback": True} if fallback else {}))
+            # Logged at once, also for an early (speculative) reply. They used to be parked until the page confirmed the turn, and in two
+            # replies of one test the confirmation never took effect, so clips that were played had neither a log line nor an audio file.
+            # An early reply that is thrown away is recorded by a "discarded" event with the same spec_id; what was heard is in "ai played".
+            clip_id = log_audio("ai", audio)
+            log_chat("ai", sentence, clip_id, turn=my_turn, source="fallback" if fallback else "llm", script_mode=req.script_mode or None, script_talk=(req.script_talk or "close") if req.script_mode else None,
+                     speculative=req.speculative or None, spec_id=req.spec_id or None,
+                     stretch_kind=d[0] if d else None, stretch_factor=d[1] if d else None, **({"continued": True} if req.cont else {}), **({"fallback": True} if fallback else {}))
             return json.dumps({"text": sentence, "audio": base64.b64encode(audio).decode(), "id": clip_id}) + "\n"
 
         def llm_chunks():
@@ -1326,10 +1328,10 @@ def api_chat_stream(req: StreamRequest):
                 pass
             elif discarded:  # you kept talking: this reply never happened (nothing logged, history untouched)
                 print(f"[speculative] discarded after {len(spoken)} sentence(s)", flush=True)
-                log_chat("event", "speculative reply discarded (you kept talking)", sentences_ready=len(spoken), turn=my_turn)
+                log_chat("event", "speculative reply discarded (you kept talking)", sentences_ready=len(spoken), turn=my_turn, spec_id=req.spec_id)
             else:
                 if spec:
-                    log_chat("event", "speculative reply committed", turn=my_turn)
+                    log_chat("event", "speculative reply committed", turn=my_turn, spec_id=req.spec_id)
                 if cancelled():
                     print(f"[interrupted] after {len(spoken)} sentence(s)", flush=True)
                     log_chat("event", "interrupted", sentences_sent=len(spoken), turn=my_turn)
