@@ -1048,7 +1048,8 @@ CONTINUE_PROMPT = "（相手は黙っています。気まずくならないよ�
 
 
 class StreamRequest(TTSRequest):
-    script_mode: bool = False  # a fixed script is running: the LLM only reacts briefly or answers an interjection
+    script_mode: bool = False  # a fixed script is running: the LLM only reacts briefly, follows up, or answers an interjection
+    script_talk: str = ""  # "followup" | "close" | "answer": what the LLM is asked to do (see script_prompt)
     cont: bool = False  # silence-breaking turn: `text` is ignored, CONTINUE_PROMPT is used and no user line is logged
     speculative: bool = False  # reply generated while you pause: nothing is logged/kept unless /api/spec/commit follows
     spec_id: str = ""
@@ -1201,8 +1202,9 @@ def api_chat_stream(req: StreamRequest):
             for attempt in range(1, LLM_ATTEMPTS + 1):
                 got = False
                 try:
-                    stream = llm_stream(history + [turn("user", user[1] + REACTION_HINT) if req.script_mode else user], cancelled, req.llm or None,
-                                        SCRIPT_SYSTEM_PROMPT if req.script_mode else None)
+                    talk = req.script_talk or "close"
+                    stream = llm_stream(history + [turn("user", user[1] + TALK_HINTS[talk]) if req.script_mode else user], cancelled, req.llm or None,
+                                        script_prompt(talk) if req.script_mode else None)
                     try:
                         for piece in stream:
                             if cancelled():
@@ -1286,14 +1288,42 @@ def api_chat_stream(req: StreamRequest):
 # or answers an interjection. Every AI line in the log has source = "script" | "llm" | "filler" | "fallback".
 SCRIPTS_DIR = HERE / "scripts"  # one JSON file per script; the page picks which one to run
 DEFAULT_SCRIPT = "italy_trip.json"
-# While a script runs, the LLM must not tell its own story (it once invented a Paris trip right before the scripted Italy story).
-SCRIPT_SYSTEM_PROMPT = """\
-あなたは「あおい」、25歳の女性です。今は相手に自分の旅行の話をしている途中です。
-あなたの話の内容はすべて台本で決まっています。あなたが自分で旅行の体験を作って話してはいけません。
-相手が話したことに、一文だけ、短く自然な相づちや感想を返してください。です・ます調で話してください。
-新しい話題や質問は出さないでください。相手の言葉を繰り返さないでください。
+# While a script runs the LLM talks as the person who made the trip, but the trip itself is the script: it may only use the
+# script's content as facts (it once invented a Paris trip right before the scripted Italy story, and answered an interjection
+# with details the script never had). Persona text is gender-neutral on purpose: the voice (male / female) is the only difference
+# between the two system profiles.
+SCRIPT_BASE_PROMPT = """\
+あなたは、相手に自分の旅行の話をしている人です。相手の話をよく聞いて、自然に会話してください。
+です・ます調の、短い話し言葉で、1〜2文で答えてください。相手の言葉をそのまま繰り返さないでください。
 """
-REACTION_HINT = "（一文だけ、短く自然に相づちや感想を返してください。質問や新しい話題は出さないでください。）"
+TALK_RULES = {
+    "close": "今回は相手の答えに、一文だけ、短く相づちや感想を返してください。質問や新しい話題は出さないでください。",
+    "followup": "相手の答えに短く反応して、相手のことをもっと知るために、答えに関連する質問を一つだけしてください。自分の旅行の話は足さないでください。",
+    "answer": "相手の質問や感想に、台本の内容に基づいて短く答えてください。こちらから質問や新しい話題は出さないでください。",
+}
+TALK_HINTS = {
+    "close": "（一文だけ、短く自然に相づちや感想を返してください。質問や新しい話題は出さないでください。）",
+    "followup": "（短く反応して、答えに関連する質問を一つだけしてください。自分の話は足さないでください。）",
+    "answer": "（台本の内容に基づいて、短く答えてください。質問はしないでください。）",
+}
+
+
+def script_story_text() -> str:
+    """The whole script as plain text (markers removed): what the speaker 'remembers' about the trip."""
+    lines = []
+    for b in script_data.get("blocks", []):
+        for u in b["units"]:
+            if u["kind"] in ("story", "outro"):
+                lines.append(re.sub(r"\s*\|[SsWw]\s*", "", u["text"]).strip())
+    return "\n".join(lines)
+
+
+def script_prompt(talk: str) -> str:
+    return (SCRIPT_BASE_PROMPT + "\nあなたの旅行の話（台本）は次のとおりです。\n" + script_story_text()
+            + "\n\n台本に書かれていることだけを事実として話してください。台本にないことを聞かれたら、作り話をせず、"
+              "「そこまでは覚えていないですね」のように正直に答えてください。\n" + TALK_RULES.get(talk, TALK_RULES["close"]))
+
+
 script_data: dict = {"file": None, "blocks": [], "warnings": [], "error": None}
 
 
@@ -1344,9 +1374,9 @@ def load_script(name: str | None = None) -> dict:
             blocks.append({"id": bid, "units": units})
         if (raw.get("outro") or "").strip():
             blocks.append({"id": "outro", "units": [{"kind": "outro", "text": raw["outro"].strip()}]})
-        script_data = {"file": name, "blocks": blocks, "warnings": warnings, "error": None}
+        script_data = {"file": name, "blocks": blocks, "warnings": warnings, "error": None, "bridge": (raw.get("bridge") or "").strip()}
     except Exception as e:
-        script_data = {"file": name, "blocks": [], "warnings": [], "error": repr(e)}
+        script_data = {"file": name, "blocks": [], "warnings": [], "error": repr(e), "bridge": ""}
     return script_data
 
 
@@ -1389,12 +1419,22 @@ class ScriptUnitRequest(TTSRequest):
 def api_script_unit(req: ScriptUnitRequest):
     """Speak one unit (a story segment, a question, or the outro) of the script: phrase chunks, each its own clip, NDJSON like chat_stream."""
     try:
-        unit = script_data["blocks"][req.block]["units"][req.unit]
+        if req.unit == -1:  # the optional "bridge" line that leads back to the script after a free talk
+            if not script_data.get("bridge"):
+                raise HTTPException(404, "this script has no bridge line")
+            unit = {"kind": "bridge", "text": script_data["bridge"]}
+        else:
+            unit = script_data["blocks"][req.block]["units"][req.unit]
     except (IndexError, KeyError):
         raise HTTPException(404, "no such script unit")
     cues = parse_cues(unit["text"])
     plain = re.sub(r"^\s*\(handoff\)\s*", "", unit["text"])  # a "(handoff)" label in the script is never spoken
-    chunks = cues if cues is not None else [(c, None) for c in split_chunks(plain, SENTENCE_END)]
+    if cues is not None:
+        chunks = cues
+    elif unit["kind"] in ("question", "outro", "bridge"):
+        chunks = [(plain.strip(), None)]  # a question / the outro is one thought: one clip, so no artificial pause or pitch reset at its comma
+    else:
+        chunks = [(c, None) for c in split_chunks(plain, SENTENCE_END)]
     block_id = script_data["blocks"][req.block]["id"]
     my_turn = turn_no  # a barge-in (/api/interrupt) or a newer chat request bumps turn_no and stops this unit
 

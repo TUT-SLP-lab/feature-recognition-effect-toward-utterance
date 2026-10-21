@@ -119,6 +119,9 @@
       <select id="script-file"></select>
     </label>
     <button id="script-restart">↻ Restart script from block 1</button>
+    <label>Free-talk replies after each question
+      <input id="script-rounds" type="number" min="1" max="4" step="1" value="2" style="width:70px">
+    </label>
     <label>Wait for an answer (s)
       <input id="script-wait" type="number" min="3" max="60" step="1" value="12" style="width:80px">
     </label>
@@ -427,7 +430,7 @@ function startStream(text, speculative, cont = false) {
   s.promise = (async () => {
     const r = await api("/api/chat_stream", {
       method: "POST", headers: {"Content-Type": "application/json"}, signal: s.ctrl.signal,
-      body: JSON.stringify({ text, speculative, cont, script_mode: script.on, spec_id: s.id, llm: $("llm").value, test: $("dbg-test").checked, model: $("model").value,
+      body: JSON.stringify({ text, speculative, cont, script_mode: script.on, script_talk: scriptTalkMode(), spec_id: s.id, llm: $("llm").value, test: $("dbg-test").checked, model: $("model").value,
                              style: $("style").value, style_weight: +$("sw").value, length: +$("len").value, stretch_table: STRETCH_TABLE, stretch_jitter: STRETCH_JITTER }),
     });
     const reader = r.body.getReader(), dec = new TextDecoder();
@@ -482,7 +485,9 @@ async function chatTurn(cont = false) {
     s = startStream(text, false, cont);
   }
   chatCtrl = s.ctrl;
-  if (script.on && script.phase === "question") { script.phase = "reaction"; scriptStatus(`block ${script.block + 1}: reacting to your answer`); }
+  if (script.on && (script.phase === "question" || script.phase === "freetalk")) {
+    script.ft++; script.phase = "reaction"; scriptStatus(`block ${script.block + 1}: free talk, reply ${script.ft} of ${script.rounds}`);
+  }
   setStatus(s.got ? "Speaking…" : "Thinking…");
   let failed = false;
   try {
@@ -878,7 +883,16 @@ $("pv").addEventListener("mousemove", () => { $("pv").classList.remove("idle"); 
 // ---------- fixed story script (files in the scripts folder) ----------
 // A block = story units (each followed by a slot for aizuchi) + a question. The story is spoken as written; the LLM only
 // reacts to the answer to a question, or answers an interjection, after which the script carries on.
-const script = { on: false, blocks: [], block: 0, unit: 0, phase: "idle", epoch: 0, playingUnit: -1, ctrl: null, answerWait: 12 };
+const script = { on: false, blocks: [], block: 0, unit: 0, phase: "idle", epoch: 0, playingUnit: -1, ctrl: null, answerWait: 12,
+                 rounds: 2, ft: 0, hasBridge: false, bridgeNext: false };  // rounds = LLM replies after each question (free talk); ft = replies so far
+// What the LLM is asked to do right now: follow up on the answer with a question, close with a short reaction, or answer an interjection.
+function scriptTalkMode() {
+  if (!script.on) return "";
+  if (script.phase === "playing") return "answer";
+  if (script.phase === "question") return script.rounds > 1 ? "followup" : "close";
+  if (script.phase === "freetalk") return script.ft + 1 < script.rounds ? "followup" : "close";
+  return "close";
+}
 const scriptBusy = () => script.on && script.phase === "playing";  // reading story units: speech over it is an aizuchi unless it lasts
 const scriptStatus = t => { $("script-status").textContent = t; };
 const scriptEvent = (text, block = script.block) => fetch("/api/script/event", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ text, block }) }).catch(() => {});
@@ -906,6 +920,7 @@ async function scriptBegin() {  // called when the conversation starts in the Sc
     if (d.error || !d.blocks.length) { scriptStatus((d.file || "script") + ": " + (d.error || "no blocks")); return; }
     d.warnings.forEach(w => dbg("script: " + w, "warn"));
     script.blocks = d.blocks; script.answerWait = +$("script-wait").value;
+    script.rounds = Math.max(1, Math.min(4, +$("script-rounds").value || 2)); script.ft = 0; script.bridgeNext = false; script.hasBridge = !!d.bridge;
     Object.assign(script, { on: true, block: 0, unit: 0, playingUnit: -1 });
     unanswered.length = 0; botSpoke = true; contCount = 0;
     scriptEvent(`script started: ${d.file}`); scriptPlay();
@@ -942,6 +957,7 @@ async function scriptPlay() {
   scriptStatus(`block ${script.block + 1}/${script.blocks.length} (${blk.id}): unit ${script.unit + 1}/${blk.units.length}`);
   if (script.unit === 0) scriptEvent(`block started: ${blk.id}`);
   try {
+    if (script.bridgeNext && script.hasBridge && script.unit === 0) { script.bridgeNext = false; await scriptFetchUnit(blk, -1, my); }  // leads back to the script after a free talk
     while (script.unit < blk.units.length && script.epoch === my) {  // the next unit is fetched while the previous one plays
       const u = script.unit++;
       await scriptFetchUnit(blk, u, my);
@@ -951,17 +967,23 @@ async function scriptPlay() {
     await whenIdle();                  // everything has been spoken
     if (script.epoch !== my) return;
     const last = blk.units[blk.units.length - 1];
-    if (last.kind === "question") { script.phase = "question"; scriptStatus(`block ${script.block + 1}: waiting for your answer`); scriptEvent(`question asked, waiting up to ${script.answerWait}s`); }
+    if (last.kind === "question") { script.phase = "question"; script.ft = 0; scriptStatus(`block ${script.block + 1}: waiting for your answer`); scriptEvent(`question asked, waiting up to ${script.answerWait}s`); }
     else scriptNext();
   } catch (e) { if (e.name !== "AbortError") { dbg("script failed: " + e.message, "warn"); scriptStatus("failed: " + e.message); } }
 }
 function scriptNext(why) {
   if (!script.on) return;
+  script.bridgeNext = script.ft > 0; script.ft = 0;   // after a free talk the optional bridge line leads back into the script
   script.phase = "between"; script.block++; script.unit = 0; script.playingUnit = -1;
-  if (script.block >= script.blocks.length) { scriptEvent("script finished"); scriptStop("script finished"); return; }
+  if (script.block >= script.blocks.length) {
+    scriptEvent("script finished"); scriptStop("script finished");
+    // the outro has been spoken (scriptPlay waits for the audio to end): end the conversation too
+    setTimeout(() => { if (listening) { scriptEvent("conversation ended after the script", null); $("mic").click(); } }, 800);
+    return;
+  }
   if (why) { dbg("script: " + why, "bc"); scriptEvent(why, script.block - 1); }
   const my = script.epoch;
-  setTimeout(() => { if (script.on && script.phase === "between" && script.epoch === my && !chatCtrl) scriptPlay(); }, 600);
+  setTimeout(() => { if (script.on && script.phase === "between" && script.epoch === my && !chatCtrl) scriptPlay(); }, 250);
 }
 // You interrupted (a real word, not an aizuchi): the story units still queued are dropped; the LLM answers; then the script resumes.
 function scriptOnBarge() {
@@ -976,16 +998,21 @@ function scriptOnBarge() {
 }
 // The LLM finished answering: carry on with the script.
 function scriptAfterReply() {
-  if (script.phase === "question" || script.phase === "reaction") scriptNext();
+  if (script.phase === "reaction") {
+    if (script.ft < script.rounds) {   // more free talk: wait for the user's next turn
+      script.phase = "freetalk"; scriptStatus(`block ${script.block + 1}: free talk, waiting for you`); scriptEvent(`free talk: reply ${script.ft} of ${script.rounds} done, waiting for the user`);
+    } else scriptNext();
+  }
+  else if (script.phase === "question") scriptNext();
   else if (script.phase === "playing") { scriptEvent("resuming the block after an interjection"); scriptPlay(); }
 }
 // Runs every 250 ms while a script is on: no answer to a question within the wait = move on to the next block.
 function scriptTick() {
-  if (script.phase !== "question") { silentSince = null; return; }
+  if (script.phase !== "question" && script.phase !== "freetalk") { silentSince = null; return; }
   const busy = !listening || chatCtrl || playing || queue.length || asrPending > 0 || vad.state === "speech" || unanswered.length || spec;
   if (busy) { silentSince = null; return; }
   if (silentSince == null) { silentSince = Date.now(); return; }
-  if (Date.now() - silentSince >= script.answerWait * 1000) { silentSince = null; scriptNext(`no answer within ${script.answerWait}s, next block`); }
+  if (Date.now() - silentSince >= script.answerWait * 1000) { silentSince = null; scriptNext(`no ${script.phase === "freetalk" ? "reply" : "answer"} within ${script.answerWait}s, next block`); }
 }
 
 // ---------- ASR comparison ----------
