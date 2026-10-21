@@ -1006,7 +1006,7 @@ def api_filler(req: TTSRequest):
         _filler_cache[key] = synth(req)
     audio = _filler_cache[key]
     clip_id = log_audio("ai", audio)
-    log_chat("ai", req.text, clip_id, backchannel=True, source="filler")
+    log_chat("ai", req.text, clip_id, backchannel=True, source="filler", tts_model=req.model, tts_style=req.style, tts_length=req.length)
     return {"text": req.text, "audio": base64.b64encode(audio).decode(), "id": clip_id}
 
 
@@ -1251,7 +1251,7 @@ def api_chat_stream(req: StreamRequest):
             # replies of one test the confirmation never took effect, so clips that were played had neither a log line nor an audio file.
             # An early reply that is thrown away is recorded by a "discarded" event with the same spec_id; what was heard is in "ai played".
             clip_id = log_audio("ai", audio)
-            log_chat("ai", sentence, clip_id, turn=my_turn, source="fallback" if fallback else "llm", script_mode=req.script_mode or None, script_talk=(req.script_talk or "close") if req.script_mode else None,
+            log_chat("ai", sentence, clip_id, turn=my_turn, source="fallback" if fallback else "llm", tts_model=req.model, tts_style=req.style, tts_length=req.length, script_mode=req.script_mode or None, script_talk=(req.script_talk or "close") if req.script_mode else None,
                      speculative=req.speculative or None, spec_id=req.spec_id or None,
                      stretch_kind=d[0] if d else None, stretch_factor=d[1] if d else None, **({"continued": True} if req.cont else {}), **({"fallback": True} if fallback else {}))
             return json.dumps({"text": sentence, "audio": base64.b64encode(audio).decode(), "id": clip_id}) + "\n"
@@ -1509,7 +1509,7 @@ def api_script_unit(req: ScriptUnitRequest):
             d = tail_stretcher.decide_cue(cue, req.stretch_table, req.stretch_jitter) if cue else tail_stretcher.decide(c, req.stretch_table, req.stretch_jitter)
             audio = synth(req.model_copy(update={"text": c}), stretch=d[1] if d else None)
             clip_id = log_audio("ai", audio)
-            log_chat("ai", c, clip_id, source="script", script_file=script_data.get("file"), script_block=block_id, script_unit=req.unit, script_kind=unit["kind"], chunk=i, cue=cue,
+            log_chat("ai", c, clip_id, source="script", tts_model=req.model, tts_style=req.style, tts_length=req.length, script_file=script_data.get("file"), script_block=block_id, script_unit=req.unit, script_kind=unit["kind"], chunk=i, cue=cue,
                      stretch_kind=d[0] if d else None, stretch_factor=d[1] if d else None)
             spoken.append(c)
             yield json.dumps({"text": c, "audio": base64.b64encode(audio).decode(), "id": clip_id, "unit": req.unit,
@@ -1523,11 +1523,15 @@ def api_script_unit(req: ScriptUnitRequest):
 class ScriptEvent(BaseModel):
     text: str
     block: int | None = None
+    extra: dict | None = None  # e.g. the settings snapshot written when a conversation starts
 
 
 @app.post("/api/script/event")
 def api_script_event(ev: ScriptEvent):
-    log_chat("event", ev.text, source="script", script_file=script_data.get("file"), script_block=script_data["blocks"][ev.block]["id"] if ev.block is not None and 0 <= ev.block < len(script_data["blocks"]) else None)
+    extra = {k: v for k, v in (ev.extra or {}).items() if k not in ("role", "text", "audio", "hold", "source", "script_block")}
+    extra.setdefault("script_file", script_data.get("file"))
+    log_chat("event", ev.text, source="script", **extra,
+             script_block=script_data["blocks"][ev.block]["id"] if ev.block is not None and 0 <= ev.block < len(script_data["blocks"]) else None)
     return {"ok": True}
 
 
