@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aizuchi annotation</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1d2129; --muted:#6b7280; --line:#d8dce2; --accent:#2563eb; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#12151a; --card:#1b2028; --text:#e6e9ef; --muted:#8b93a1; --line:#2c3440; --accent:#6ea0ff; } }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 system-ui, "Hiragino Sans", "Noto Sans JP", sans-serif; }
+  main { max-width:1500px; margin:0 auto; padding:14px 16px 40px; display:grid; grid-template-columns:minmax(0,1fr); gap:12px; }
+  main > *, .grid > * { min-width:0; }
+  h1 { font-size:18px; margin:0; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px; }
+  .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+  button, select, input { font:inherit; color:var(--text); background:var(--card); border:1px solid var(--line); border-radius:8px; padding:6px 10px; }
+  button { cursor:pointer; } button.primary { background:var(--accent); color:#fff; border-color:transparent; }
+  button.t-aizuchi { border-color:#2563eb; } button.t-laugh { border-color:#d97706; } button.t-reaction { border-color:#16a34a; } button.t-other { border-color:#6b7280; }
+  .muted { color:var(--muted); font-size:12px; }
+  #scroll { overflow-x:auto; position:relative; border:1px solid var(--line); border-radius:8px; background:var(--card); }
+  #wrap { position:relative; } #head { position:absolute; top:0; bottom:0; width:2px; background:#dc2626; pointer-events:none; }
+  table { border-collapse:collapse; width:100%; } th, td { border-bottom:1px solid var(--line); padding:4px 8px; text-align:left; vertical-align:middle; }
+  th { color:var(--muted); font-weight:600; font-size:12px; } td input[type=number] { width:80px; } td input[type=text] { width:100%; min-width:120px; }
+  .tag { display:inline-block; padding:0 6px; border-radius:6px; font-size:12px; } .ok { background:#16a34a22; color:#16a34a; } .miss { background:#dc262622; color:#dc2626; }
+  kbd { border:1px solid var(--line); border-bottom-width:2px; border-radius:4px; padding:0 5px; font-size:12px; }
+  .grid { display:grid; grid-template-columns:minmax(0,1fr) 340px; gap:12px; } @media (max-width:1100px) { .grid { grid-template-columns:1fr; } }
+  #cands { max-height:300px; overflow:auto; } .cand { padding:3px 6px; border-radius:6px; cursor:pointer; display:flex; justify-content:space-between; gap:8px; } .cand:hover { background:var(--bg); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Aizuchi annotation <span class="muted">— listen, press a key at each aizuchi or reaction; marks are saved automatically</span></h1>
+
+  <section class="card">
+    <div class="row">
+      <label>Session <select id="session" style="min-width:260px"></select></label>
+      <button id="play" class="primary">▶ Play (Space)</button>
+      <span id="time" style="font-variant-numeric:tabular-nums;min-width:120px">0.00 / 0.00 s</span>
+      <label>Speed <select id="rate"><option>0.5</option><option>0.75</option><option selected>1</option><option>1.25</option><option>1.5</option></select></label>
+      <label>Zoom <input id="zoom" type="range" min="20" max="200" step="10" value="60" style="width:110px"></label>
+      <span id="saved" class="muted"></span>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button class="t-aizuchi" data-type="aizuchi">Aizuchi <kbd>A</kbd></button>
+      <button class="t-laugh" data-type="laugh">Laugh <kbd>L</kbd></button>
+      <button class="t-reaction" data-type="reaction">Other reaction (えっ, へえ…) <kbd>E</kbd></button>
+      <button class="t-other" data-type="other">Other sound <kbd>O</kbd></button>
+      <button id="undo">Undo last <kbd>Z</kbd></button>
+      <button id="replay">Replay last 3 s <kbd>R</kbd></button>
+      <span class="muted"><kbd>←</kbd><kbd>→</kbd> ±1 s (<kbd>Shift</kbd> ±5 s) · <kbd>[</kbd><kbd>]</kbd> previous / next suggested sound · click the timeline to jump</span>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="muted" style="margin-bottom:4px">
+      Top lane: <b>system voice</b> (bars: <span style="color:#2563eb">S</span> strong cue, <span style="color:#38bdf8">W</span> weak cue, <span style="color:#a855f7">question</span>, <span style="color:#16a34a">LLM</span>).
+      Bottom lane: <b>participant</b> (boxes: <span style="color:#16a34a">logged backchannel</span>, <span style="color:#6b7280">answer</span>, <span style="color:#f59e0b">sound the system did not log</span>). Vertical lines are your marks.
+    </div>
+    <div id="scroll"><div id="wrap"><canvas id="cv" height="290"></canvas><div id="head"></div></div></div>
+  </section>
+
+  <div class="grid">
+    <section class="card">
+      <div class="row" style="justify-content:space-between"><b>Marks</b><span id="summary" class="muted"></span></div>
+      <table><thead><tr><th>#</th><th>Time (s)</th><th>Type</th><th>Note</th><th>What the system saw</th><th></th></tr></thead><tbody id="rows"></tbody></table>
+    </section>
+    <section class="card">
+      <div class="row" style="justify-content:space-between"><b>Suggested sounds</b>
+        <select id="candfilter"><option value="unlogged">not logged by the system</option><option value="all">all</option></select></div>
+      <div class="muted" style="margin:4px 0">Short sounds the detector found in the participant channel. Click one to jump there.</div>
+      <div id="cands"></div>
+    </section>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const COLORS = { aizuchi: "#2563eb", laugh: "#d97706", reaction: "#16a34a", other: "#6b7280" };
+const KEYS = { a: "aizuchi", l: "laugh", e: "reaction", o: "other" };
+const au = new Audio(); au.preload = "auto";
+let S = null, marks = [], pps = 60, saveTimer = null, nextId = 1, off = null;
+const H = 290, LANE_SYS = { y0: 14, y1: 126 }, LANE_HUM = { y0: 150, y1: 262 };
+const esc = s => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;");
+
+async function api(path, opts) { const r = await fetch(path, opts); if (!r.ok) throw new Error((await r.text()).slice(0, 200)); return r.json(); }
+
+async function init() {
+  const list = await api("/api/sessions");
+  $("session").innerHTML = list.map(s => `<option value="${esc(s.path)}">${esc(s.path)}${s.script ? " · " + esc(s.script.replace(".json", "")) : ""}${s.voice ? " · " + esc(s.voice) : ""}${s.marks != null ? ` (${s.marks} marks)` : ""}</option>`).join("");
+  const want = new URLSearchParams(location.search).get("session");
+  if (want && list.some(s => s.path === want)) $("session").value = want;
+  if (list.length) load($("session").value);
+}
+$("session").onchange = () => load($("session").value);
+
+async function load(path) {
+  au.pause(); $("saved").textContent = "loading… (first time the mixes are made, this can take a few seconds)";
+  S = await api("/api/session?path=" + encodeURIComponent(path));
+  marks = S.marks.map(m => ({ ...m, id: nextId++ }));
+  au.src = S.audio; au.playbackRate = +$("rate").value;
+  history.replaceState(null, "", "?session=" + encodeURIComponent(path));
+  draw(); renderMarks(); renderCands(); $("saved").textContent = marks.length ? "loaded saved marks" : "";
+  updateTime();
+}
+
+// ---- timeline (drawn once into the canvas; the playhead is a separate element)
+function laneWave(g, arr, lane, color, scale) {
+  const mid = (lane.y0 + lane.y1) / 2, half = (lane.y1 - lane.y0) / 2, step = S.peak_s * pps;
+  g.fillStyle = color;
+  for (let i = 0; i < arr.length; i++) {
+    const a = Math.min(1, arr[i] / 100 * scale) * half;
+    if (a > 0.4) g.fillRect(i * step, mid - a, Math.max(1, step), a * 2);
+  }
+}
+function draw() {
+  if (!S) return;
+  pps = Math.min(+$("zoom").value, Math.floor(30000 / S.duration));
+  const cv = $("cv"), w = Math.ceil(S.duration * pps) + 20; cv.width = w; cv.height = H; $("wrap").style.width = w + "px";
+  const g = cv.getContext("2d"), dark = matchMedia("(prefers-color-scheme: dark)").matches;
+  g.clearRect(0, 0, w, H); g.font = "11px system-ui, sans-serif"; g.textBaseline = "top";
+  const ink = dark ? "#8b93a1" : "#6b7280", line = dark ? "#2c3440" : "#e5e7eb";
+  g.strokeStyle = line; g.lineWidth = 1;
+  for (const lane of [LANE_SYS, LANE_HUM]) { g.beginPath(); g.moveTo(0, (lane.y0 + lane.y1) / 2); g.lineTo(w, (lane.y0 + lane.y1) / 2); g.stroke(); }
+  // system lane: wave and clip bars
+  laneWave(g, S.system, LANE_SYS, dark ? "#4b5563" : "#cbd5e1", 1.2);
+  for (const c of S.clips) {
+    const col = c.cue === "S" ? "#2563eb" : c.cue === "W" ? "#38bdf8" : c.kind === "question" ? "#a855f7" : c.source === "llm" ? "#16a34a" : "#9ca3af";
+    g.fillStyle = col; g.globalAlpha = 0.85; g.fillRect(c.start * pps, 2, Math.max(2, (c.end - c.start) * pps), 8); g.globalAlpha = 1;
+    if ((c.end - c.start) * pps > 24) { g.fillStyle = ink; g.fillText(c.cue || (c.kind || "").slice(0, 3), c.start * pps + 2, 128); }
+  }
+  // participant lane: wave, suggested sounds, logged events
+  laneWave(g, S.human, LANE_HUM, dark ? "#7aa2ff" : "#2563eb", 1);
+  for (const c of S.candidates) {
+    const col = c.logged === "backchannel" ? "#16a34a" : c.logged === "user" ? "#6b7280" : "#f59e0b";
+    g.strokeStyle = col; g.fillStyle = col; g.globalAlpha = 0.18; g.fillRect(c.start * pps, LANE_HUM.y0 - 4, (c.end - c.start) * pps, LANE_HUM.y1 - LANE_HUM.y0 + 8);
+    g.globalAlpha = 1; g.lineWidth = 1.5; g.strokeRect(c.start * pps, LANE_HUM.y0 - 4, (c.end - c.start) * pps, LANE_HUM.y1 - LANE_HUM.y0 + 8);
+  }
+  g.fillStyle = ink;
+  for (const e of S.events) if (e.role === "backchannel") g.fillText(e.text.slice(0, 10), e.start * pps, LANE_HUM.y1 + 8);
+  // time ruler
+  g.fillStyle = ink; g.strokeStyle = line;
+  for (let t = 0; t <= S.duration; t += 5) { g.beginPath(); g.moveTo(t * pps, H - 22); g.lineTo(t * pps, H - 12); g.stroke(); g.fillText(`${t}s`, t * pps + 3, H - 14); }
+  // marks
+  for (const m of marks) {
+    g.strokeStyle = COLORS[m.type] || "#6b7280"; g.lineWidth = 2; g.beginPath(); g.moveTo(m.t * pps, 0); g.lineTo(m.t * pps, H - 22); g.stroke();
+    g.fillStyle = COLORS[m.type]; g.fillText(m.type[0].toUpperCase(), m.t * pps + 3, 0);
+  }
+}
+$("zoom").oninput = () => { const t = au.currentTime; draw(); updateTime(); $("scroll").scrollLeft = Math.max(0, t * pps - $("scroll").clientWidth / 2); };
+$("scroll").addEventListener("click", e => { if (!S) return; const x = e.clientX - $("scroll").getBoundingClientRect().left + $("scroll").scrollLeft; au.currentTime = Math.max(0, Math.min(S.duration, x / pps)); updateTime(); });
+
+function updateTime() {
+  if (!S) return;
+  const t = au.currentTime; $("head").style.left = t * pps + "px";
+  $("time").textContent = `${t.toFixed(2)} / ${S.duration.toFixed(2)} s`;
+  const sc = $("scroll"), x = t * pps;
+  if (!au.paused && (x > sc.scrollLeft + sc.clientWidth * 0.8 || x < sc.scrollLeft)) sc.scrollLeft = Math.max(0, x - sc.clientWidth * 0.2);
+}
+(function loop() { updateTime(); requestAnimationFrame(loop); })();
+au.addEventListener("play", () => $("play").textContent = "⏸ Pause (Space)"); au.addEventListener("pause", () => $("play").textContent = "▶ Play (Space)");
+$("play").onclick = () => au.paused ? au.play() : au.pause();
+$("rate").onchange = () => au.playbackRate = +$("rate").value;
+
+// ---- marks
+function addMark(type, t = null, note = "") {
+  if (!S) return;
+  const when = t ?? au.currentTime;  // exactly where the playhead is when the key is pressed
+  marks.push({ id: nextId++, t: Math.round(when * 1000) / 1000, type, note }); changed();
+}
+function changed() { marks.sort((a, b) => a.t - b.t); draw(); renderMarks(); scheduleSave(); }
+let dirty = false;
+function scheduleSave() { dirty = true; $("saved").textContent = "unsaved…"; clearTimeout(saveTimer); saveTimer = setTimeout(save, 400); }
+async function save() {
+  saveTimer = null;
+  try {
+    const r = await api("/api/annotations?path=" + encodeURIComponent(S.path), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ marks: marks.map(({ id, t, type, note }) => ({ id, t, type, note })) }) });
+    const byId = new Map(r.marks.map(m => [m.id, m])); marks = marks.map(m => ({ ...m, ...(byId.get(m.id) || {}) })); renderMarks();
+    dirty = false; $("saved").textContent = "saved " + new Date().toLocaleTimeString();
+  } catch (e) { $("saved").textContent = "SAVE FAILED: " + e.message; }
+}
+function renderMarks() {
+  $("rows").innerHTML = marks.map((m, i) => {
+    const sys = m.caught_by_system === undefined ? "" :
+      `<span class="tag ${m.caught_by_system ? "ok" : "miss"}">${m.caught_by_system ? "system logged it" : (m.logged_role ? "logged as " + m.logged_role : "not logged")}</span> ` +
+      (m.logged_text ? `「${esc(m.logged_text)}」 ` : "") + (m.system_clip_cue || m.system_clip_kind ? `<span class="muted">${m.during_clip ? "during a " + esc(m.system_clip_cue || m.system_clip_kind) + " clip, " + m.seconds_into_clip + " s in" : "after a " + esc(m.system_clip_cue || m.system_clip_kind) + " clip, +" + m.seconds_after_clip_end + " s"} (nearest clip end ${m.offset_from_nearest_clip_end >= 0 ? "+" : ""}${m.offset_from_nearest_clip_end} s)</span>` : "");
+    return `<tr><td>${i + 1}</td><td><input type="number" step="0.05" min="0" value="${m.t}" data-id="${m.id}" data-f="t"></td>` +
+      `<td><select data-id="${m.id}" data-f="type">${Object.keys(COLORS).map(k => `<option ${k === m.type ? "selected" : ""}>${k}</option>`).join("")}</select></td>` +
+      `<td><input type="text" value="${esc(m.note)}" data-id="${m.id}" data-f="note"></td><td>${sys}</td>` +
+      `<td style="white-space:nowrap"><button data-play="${m.id}">▶</button> <button data-del="${m.id}">✕</button></td></tr>`;
+  }).join("");
+  const n = t => marks.filter(m => m.type === t).length, missed = marks.filter(m => m.type === "aizuchi" && m.caught_by_system === false).length;
+  $("summary").textContent = `${marks.length} marks · aizuchi ${n("aizuchi")} (${missed} not caught as backchannel by the system) · laugh ${n("laugh")} · reaction ${n("reaction")} · other ${n("other")}`;
+}
+$("rows").addEventListener("change", e => {
+  const id = +e.target.dataset.id; const m = marks.find(x => x.id === id); if (!m) return;
+  m[e.target.dataset.f] = e.target.dataset.f === "t" ? +e.target.value : e.target.value; changed();
+});
+$("rows").addEventListener("click", e => {
+  const p = e.target.dataset.play, d = e.target.dataset.del;
+  if (p) { const m = marks.find(x => x.id === +p); au.currentTime = Math.max(0, m.t - 1.5); au.play(); }
+  if (d) { marks = marks.filter(x => x.id !== +d); changed(); }
+});
+document.querySelectorAll("button[data-type]").forEach(b => b.onclick = () => addMark(b.dataset.type));
+$("undo").onclick = undo; function undo() { if (marks.length) { const last = marks.reduce((a, b) => a.id > b.id ? a : b); marks = marks.filter(m => m !== last); changed(); } }
+$("replay").onclick = replay; function replay() { au.currentTime = Math.max(0, au.currentTime - 3); au.play(); }
+
+// ---- suggested sounds
+function renderCands() {
+  const all = $("candfilter").value === "all";
+  const list = S.candidates.filter(c => all || !c.logged);
+  $("cands").innerHTML = list.length ? list.map(c => `<div class="cand" data-t="${c.start}"><span>${c.start.toFixed(1)} s · ${(c.end - c.start).toFixed(2)} s</span><span class="muted">${c.logged ? "logged as " + c.logged : "not logged"}</span></div>`).join("") : '<div class="muted">none</div>';
+}
+$("candfilter").onchange = () => renderCands();
+$("cands").addEventListener("click", e => { const c = e.target.closest(".cand"); if (c) { au.currentTime = Math.max(0, +c.dataset.t - 1.0); au.play(); } });
+function jumpCand(dir) {
+  if (!S) return; const t = au.currentTime, all = $("candfilter").value === "all", list = S.candidates.filter(c => all || !c.logged);
+  const c = dir > 0 ? list.find(c => c.start - 1.0 > t + 0.2) : [...list].reverse().find(c => c.start - 1.0 < t - 1.2);
+  if (c) { au.currentTime = Math.max(0, c.start - 1.0); au.play(); }
+}
+
+// ---- keyboard
+document.addEventListener("keydown", e => {
+  if (e.target.matches("input[type=text], input[type=number], select, textarea") && e.key !== "Escape") return;
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const k = e.key.toLowerCase();
+  if (k === " ") { e.preventDefault(); $("play").click(); }
+  else if (KEYS[k]) { e.preventDefault(); addMark(KEYS[k]); }
+  else if (k === "z") undo();
+  else if (k === "r") replay();
+  else if (k === "arrowleft") { au.currentTime = Math.max(0, au.currentTime - (e.shiftKey ? 5 : 1)); e.preventDefault(); }
+  else if (k === "arrowright") { au.currentTime = Math.min(S.duration, au.currentTime + (e.shiftKey ? 5 : 1)); e.preventDefault(); }
+  else if (k === "]") jumpCand(1);
+  else if (k === "[") jumpCand(-1);
+});
+addEventListener("beforeunload", e => { if (dirty) { e.preventDefault(); } });  // only warns while marks are not saved yet
+init().catch(e => $("saved").textContent = "error: " + e.message);
+</script>
+</body>
+</html>
