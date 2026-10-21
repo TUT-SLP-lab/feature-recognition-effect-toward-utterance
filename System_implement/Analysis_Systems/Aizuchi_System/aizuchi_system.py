@@ -1550,4 +1550,7 @@ app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=int(os.environ.get("PORT", 8000)))
+    # Default: this computer only (http://localhost:8000, where browsers allow the microphone). To open the page from another
+    # computer (e.g. Safari on a Mac) the microphone needs https: set HOST=0.0.0.0 SSL_CERTFILE=cert.pem SSL_KEYFILE=key.pem
+    uvicorn.run(app, host=os.environ.get("HOST", "127.0.0.1"), port=int(os.environ.get("PORT", 8000)),
+                ssl_certfile=os.environ.get("SSL_CERTFILE") or None, ssl_keyfile=os.environ.get("SSL_KEYFILE") or None)
