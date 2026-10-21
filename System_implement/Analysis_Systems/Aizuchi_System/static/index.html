@@ -102,8 +102,8 @@
     <label>Pause after a phrase (、): <span id="pausev">300</span> ms
       <input id="pause" type="range" min="300" max="500" step="50" value="300">
     </label>
-    <label>Pause after a sentence (。): <span id="pausev2">850</span> ms
-      <input id="pause2" type="range" min="300" max="1500" step="50" value="850">
+    <label>Pause after a sentence (。): <span id="pausev2">550</span> ms
+      <input id="pause2" type="range" min="300" max="1500" step="50" value="550">
     </label>
     <label>Mic threshold: <span id="thv">0.020</span>
       <input id="th" type="range" min="0.005" max="0.1" step="0.005" value="0.02">
@@ -237,16 +237,22 @@
     </section>
     <section class="card row" data-dsub="bc">
       <label>Interrupt after (s) — shorter speech = backchannel
-        <input id="dbg-barge" type="number" min="0.3" max="5" step="0.1" value="1.0">
+        <input id="dbg-barge" type="number" min="0.3" max="5" step="0.05" value="0.85">
       </label>
       <label>End of speech silence (s)
-        <input id="dbg-end" type="number" min="0.3" max="3" step="0.1" value="1.0">
+        <input id="dbg-end" type="number" min="0.3" max="3" step="0.05" value="0.8">
       </label>
       <label>Start LLM early at silence (s)
-        <input id="dbg-spec-at" type="number" min="0.3" max="3" step="0.1" value="0.6">
+        <input id="dbg-spec-at" type="number" min="0.2" max="3" step="0.05" value="0.4">
       </label>
       <label style="flex-direction:row;align-items:center;gap:6px;color:var(--text);font-size:14px">
         <input id="dbg-spec-on" type="checkbox" checked> Start LLM early (speculative reply)
+      </label>
+      <label style="flex-direction:row;align-items:center;gap:6px;color:var(--text);font-size:14px">
+        <input id="dbg-hes-on" type="checkbox" checked> Wait longer after a hesitation (なんか, えーと, 〜て、…)
+      </label>
+      <label>Extra wait after a hesitation (s)
+        <input id="dbg-hes-extra" type="number" min="0.2" max="4" step="0.1" value="1.2">
       </label>
       <label>Filler “うん” at silence (s)
         <input id="dbg-filler-at" type="number" min="0.3" max="3" step="0.1" value="0.8">
@@ -375,9 +381,9 @@ $("player").onplaying = () => {
   }
 };
 // Silence between sentences = the page's pause + about 0.15 s left at the clip edges (the voice's own ~0.4 s padding is trimmed).
-let PAUSE_MS = 300, PAUSE_END_MS = 850, playEpoch = 0, lastPlayedText = "", lastPlayedCue = "";  // aizuchi slots: after a phrase 300-500 ms, after a sentence longer (+~130 ms clip edges)
+let PAUSE_MS = 300, PAUSE_END_MS = 550, playEpoch = 0, lastPlayedText = "", lastPlayedCue = "";  // aizuchi slots: after a phrase 300-500 ms, after a sentence longer (+~130 ms clip edges)
 try { const v = localStorage.getItem("pause_ms"); if (v !== null) PAUSE_MS = Math.min(500, Math.max(300, +v)); } catch (e) {}
-try { const v = localStorage.getItem("pause_end_ms"); if (v !== null) PAUSE_END_MS = Math.min(1500, Math.max(300, +v)); } catch (e) {}
+try { const v = localStorage.getItem("pause_end_ms3"); if (v !== null) PAUSE_END_MS = Math.min(1500, Math.max(300, +v)); } catch (e) {}
 const pauseAfter = text => /[。！？!?]\s*$/.test(text || "") ? PAUSE_END_MS : PAUSE_MS;  // sentence end = a longer turn-taking slot
 async function playNext(fromEnded = false) {
   reportClip(true);
@@ -389,6 +395,15 @@ async function playNext(fromEnded = false) {
     const e = playEpoch;
     await new Promise(r => setTimeout(r, gap));
     if (e !== playEpoch) return;    // you interrupted during the pause
+    // An aizuchi that has already started is let finish: the next clip waits until you have been quiet for 0.25 s (at most 2.5 s),
+    // so a late aizuchi is not talked over and the pause itself can stay short.
+    if (vad.state === "speech" && vad.quiet < 0.25) {
+      const t0 = Date.now();
+      while (vad.state === "speech" && vad.quiet < 0.25 && Date.now() - t0 < 2500) { await new Promise(r => setTimeout(r, 50)); if (e !== playEpoch) return; }
+      const waited = Date.now() - t0;
+      dbg(`waited ${(waited / 1000).toFixed(2)}s for you to finish before the next clip`, "bc");
+      if (script.on) scriptEvent(`waited ${waited} ms for the listener to finish before the next clip`);
+    }
   }
   cur = { id: item.id, start: null, filler: item.filler, meta: item.meta }; lastPlayedText = item.text; lastPlayedCue = (item.meta && item.meta.cue) || "";
   if (item.meta && item.meta.script) script.playingUnit = item.meta.unit;  // which script unit is being heard (for resuming after an interruption)
@@ -594,7 +609,7 @@ $("pause").value = PAUSE_MS; $("pausev").textContent = PAUSE_MS;
 $("pause2").value = PAUSE_END_MS; $("pausev2").textContent = PAUSE_END_MS;
 $("pause2").oninput = () => {
   PAUSE_END_MS = +$("pause2").value; $("pausev2").textContent = PAUSE_END_MS;
-  try { localStorage.setItem("pause_end_ms", PAUSE_END_MS); } catch (e) {}
+  try { localStorage.setItem("pause_end_ms3", PAUSE_END_MS); } catch (e) {}
 };
 $("pause").oninput = () => {
   PAUSE_MS = +$("pause").value; $("pausev").textContent = PAUSE_MS;
@@ -603,12 +618,19 @@ $("pause").oninput = () => {
 $("th").oninput = () => $("thv").textContent = (+$("th").value).toFixed(3);
 
 // ---------- always-on mic with simple energy VAD ----------
-let END_AFTER = 1.0;  // silence that ends your turn (the reply is prepared while you wait, see SPEC_AT)
-const PRE_ROLL = 0.3, START_AFTER = 0.2, MIN_SPEECH = 0.3, MAX_UTT = 30;
+// Hesitation rule: if the early transcript of what you have said so far ends on a filler or a continuing word (なんか, えーと, 〜て、, 〜けど、, …),
+// the turn is not judged over yet: the system waits up to HES_EXTRA longer (a reply that is already prepared stays held; if you go on
+// talking it is dropped as usual). A finished sentence (。！？) never triggers it.
+let HES_ON = true, HES_EXTRA = 1.2;
+const HES_WORDS = "なんか|なんて言うか|なんていうか|えーっと|えーと|えっと|ええと|えー|あのー|あの|そのー|その|まあ|まー|んー|うーんと|うーん|ほら|ていうか|というか|だから|それで|でも|けれど|けど|から|ので|が|し|て|で";
+const HES_RE = new RegExp(`(?:${HES_WORDS})[、,．\\.…・\\s]*$`), ENDED_RE = /[。！？!?]\s*$/, TRAIL_RE = /(?:…|\.\.\.)\s*$/;
+const hesitating = t => !!t && !ENDED_RE.test(t.trim()) && (HES_RE.test(t.trim()) || TRAIL_RE.test(t.trim()));
+let END_AFTER = 0.8;  // silence that ends your turn (the reply is prepared while you wait, see SPEC_AT)
+const PRE_ROLL = 0.3, START_AFTER = 0.2, MIN_SPEECH = 0.3, MAX_UTT = 60;
 // Filler backchannel: when you pause this long mid-turn (but haven't finished), the AI says a fixed "うん" (no LLM).
 // Speculative reply: after SPEC_AT of silence the LLM starts on what you said so far, but the reply is only held.
 // If you speak again it is thrown away; if the silence reaches END_AFTER it is released with little waiting.
-let SPEC_ON = true, SPEC_AT = 0.6;
+let SPEC_ON = true, SPEC_AT = 0.4;
 const SPEC_MIN_SPEECH = 0.6, SPEC_COOLDOWN = 1500;
 let lastSpec = 0, specSeq = 0, spec = null;  // spec = { token, stream, specText } while a speculative reply exists
 let FILLER_ON = false, FILLER_AT = 0.8;
@@ -616,7 +638,7 @@ const FILLERS = ["うん。", "うんうん。", "うん、うん。"], FILLER_M
 let lastFiller = 0, epoch = 0;
 // Silence breaking: when the bot has finished and you stay silent this long, it carries on with its story (an LLM turn
 // with no user message). At most CONT_MAX times in a row; anything you say resets the count.
-let turnEndAt = null, turnSpeech = 0, earlyUsed = false;  // end-to-end latency of the last normal turn
+let turnEndAt = null, turnSpeech = 0, turnWait = 1.0, earlyUsed = false, lastSpecAsrMs = null, lastSpecEncodeMs = null;  // end-to-end latency of the last normal turn
 let CONT_ON = true, CONT_AFTER = 5, CONT_MAX = 2, contCount = 0, botSpoke = false, silentSince = null;
 function silenceTick() {
   if (script.on) { scriptTick(); return; }  // a script is running: the silence-breaking LLM turn is off
@@ -631,7 +653,7 @@ function silenceTick() {
 }
 setInterval(silenceTick, 250);
 const BARGE_MAX = 5;  // continuous speech over the bot this long always interrupts, whatever it sounds like
-let BARGE_AFTER = 1.0;  // while the bot is talking, only speech longer than this interrupts it; shorter = backchannel
+let BARGE_AFTER = 0.85;  // while the bot is talking, only speech longer than this interrupts it; shorter = backchannel
 let listening = false, micCtx = null, micStream = null;
 const vad = { state: "idle", pre: [], preT: 0, utt: [], uttT: 0, loud: 0, quiet: 0, overBot: false };
 
@@ -686,7 +708,7 @@ function onFrame(f) {
   vad.utt.push(f); vad.uttT += dur;
   // While our own filler plays, a bit of it can leak into the mic: only clearly louder sound counts as you speaking.
   const heard = rms > (cur && cur.filler ? th * 3 : th);
-  if (heard) { vad.fillerSent = false; if (vad.specSent) { vad.specSent = false; cancelSpec(); } }  // spoke again: drop the early reply
+  if (heard) { vad.hesLogged = false; vad.fillerSent = false; if (vad.specSent) { vad.specSent = false; cancelSpec(); } }  // spoke again: drop the early reply
   vad.quiet = heard ? 0 : vad.quiet + dur;
   if (SPEC_ON && !vad.overBot && !vad.specSent && vad.quiet >= SPEC_AT && vad.quiet < END_AFTER
       && vad.uttT - vad.quiet >= SPEC_MIN_SPEECH && asrPending === 0 && Date.now() - lastSpec > SPEC_COOLDOWN) {
@@ -706,8 +728,15 @@ function onFrame(f) {
       vad.bargeChecking = true; checkBarge(vad.utt.slice(), micCtx.sampleRate, vad.startSample);
     }
   }
+  if (vad.quiet >= END_AFTER && vad.uttT < MAX_UTT && HES_ON && !vad.overBot && vad.quiet < END_AFTER + HES_EXTRA && vad.uttT - vad.quiet >= MIN_SPEECH) {
+    if (spec && !spec.stream && vad.quiet < END_AFTER + 0.5) return;   // the early transcript is still on its way: see how the turn ended first
+    if (spec && spec.stream && hesitating(spec.specText)) {
+      if (!vad.hesLogged) { vad.hesLogged = true; dbg(`you seem to be thinking (…${spec.specText.slice(-12)}) → waiting up to ${HES_EXTRA}s longer`, "bc"); scriptEvent(`waiting longer: the turn ends on a hesitation (…${spec.specText.slice(-12)})`, null); }
+      return;
+    }
+  }
   if (vad.quiet >= END_AFTER || vad.uttT >= MAX_UTT) {
-    const speech = vad.uttT - vad.quiet, frames = vad.utt, sr = micCtx.sampleRate, offset = vad.startSample / sr;
+    const quietAtEnd = vad.quiet, speech = vad.uttT - vad.quiet, frames = vad.utt, sr = micCtx.sampleRate, offset = vad.startSample / sr, range = [vad.startSample, rec.total];
     // Short speech while the bot is still talking = backchannel: transcribe and show it, but don't reply.
     const backchannel = vad.overBot && (!!chatCtrl || scriptBusy());
     dbg(`speech end — ${speech.toFixed(2)}s → ` + (backchannel ? "BACKCHANNEL" : speech >= MIN_SPEECH
@@ -720,7 +749,7 @@ function onFrame(f) {
       if (backchannel || speech < MIN_SPEECH) { specSeq++; spec = null; }
       else { spec.waited = true; specWait = spec.ready; dbg("turn ended while the early transcription is still running → waiting for it", "bc"); }
     }
-    if (!backchannel && speech >= MIN_SPEECH) { turnEndAt = performance.now(); turnSpeech = speech; }
+    if (!backchannel && speech >= MIN_SPEECH) { turnEndAt = performance.now(); turnSpeech = speech; turnWait = quietAtEnd; }
     if (backchannel) handleUtterance(encodeWav(frames, sr), true, offset);
     else if (speech >= MIN_SPEECH) handleUtterance(encodeWav(frames, sr), false, offset, specText, specWait);
     else maybeAnswer();  // too short: noise
@@ -1227,6 +1256,8 @@ $("dbg-clear").onclick = () => { dbgLines.length = 0; $("dbglog").innerHTML = ""
 $("dbg-barge").onchange = () => BARGE_AFTER = +$("dbg-barge").value;
 $("dbg-end").onchange = () => END_AFTER = +$("dbg-end").value;
 $("dbg-spec-at").onchange = () => SPEC_AT = +$("dbg-spec-at").value;
+$("dbg-hes-on").onchange = () => HES_ON = $("dbg-hes-on").checked;
+$("dbg-hes-extra").onchange = () => HES_EXTRA = +$("dbg-hes-extra").value;
 $("dbg-spec-on").onchange = () => SPEC_ON = $("dbg-spec-on").checked;
 $("dbg-filler-at").onchange = () => FILLER_AT = +$("dbg-filler-at").value;
 $("dbg-filler-on").onchange = () => FILLER_ON = $("dbg-filler-on").checked;
