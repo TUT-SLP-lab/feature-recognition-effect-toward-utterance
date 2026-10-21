@@ -347,7 +347,10 @@ function fillStyles() {
   const m = models.find(m => m.id === $("model").value);
   $("style").innerHTML = (m ? m.styles : []).map(s => `<option>${s}</option>`).join("");
 }
-$("model").onchange = () => { localStorage.setItem("sbv2_model", $("model").value); fillStyles(); };
+// Load the chosen voice now (a first reply in a voice that is not loaded yet takes ~1.3 s longer).
+const ttsWarm = () => fetch("/api/tts_warm", { method: "POST", headers: {"Content-Type": "application/json"},
+  body: JSON.stringify({ model: $("model").value, style: $("style").value, style_weight: +$("sw").value, length: +$("len").value }) }).catch(() => {});
+$("model").onchange = () => { localStorage.setItem("sbv2_model", $("model").value); fillStyles(); ttsWarm(); };
 $("sw").oninput = () => $("swv").textContent = (+$("sw").value).toFixed(1);
 $("len").oninput = () => $("lenv").textContent = (+$("len").value).toFixed(2);
 
@@ -376,7 +379,7 @@ $("player").onplaying = () => {
     const ms = Math.round(performance.now() - turnEndAt);
     dbg(`reply latency ${(ms / 1000).toFixed(2)} s after the turn ended (+${END_AFTER}s silence wait)${earlyUsed ? " — early reply used" : " — no early reply"}`, "bc");
     fetch("/api/latency", { method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({ latency_ms: ms, silence_wait_s: END_AFTER, speech_s: +turnSpeech.toFixed(2), early_reply: earlyUsed }) }).catch(() => {});
+      body: JSON.stringify({ latency_ms: ms, silence_wait_s: +turnWait.toFixed(2), speech_s: +turnSpeech.toFixed(2), early_reply: earlyUsed, spec_asr_ms: lastSpecAsrMs, spec_encode_ms: lastSpecEncodeMs }) }).catch(() => {});
     turnEndAt = null;
   }
 };
@@ -535,7 +538,7 @@ async function checkBarge(frames, sr, startSample) {
 }
 
 // You paused: transcribe what you said so far (not logged) and start the reply early, held until the turn ends.
-async function startSpec(frames, sr) {
+async function startSpec(frames, sr, range = null) {
   const token = ++specSeq;
   const me = spec = { token, stream: null, specText: null, waited: false };
   // `ready` settles when this attempt is over: with the early transcript once the LLM is started, or null if it was dropped.
@@ -545,8 +548,10 @@ async function startSpec(frames, sr) {
   dbg(`pause ≥ ${SPEC_AT}s → starting the reply early`, "bc");
   let text, isBc;
   try {
-    const fd = new FormData(); fd.append("audio", encodeWav(frames, sr), "spec.wav"); fd.append("kind", "user"); fd.append("log", "0");
-    ({ text, backchannel: isBc } = await (await api("/api/asr", { method: "POST", body: fd })).json());
+    lastSpecEncodeMs = 0;
+    const tf = performance.now();
+    ({ text, backchannel: isBc } = await postAsr({ range, kind: "user", log: 0, wav: () => { const te = performance.now(), b = encodeWav(frames, sr); lastSpecEncodeMs = Math.round(performance.now() - te); return b; } }));
+    lastSpecAsrMs = Math.round(performance.now() - tf);
   } catch (e) { if (token === specSeq) spec = null; me.settle(null); return; }
   if (token !== specSeq) { me.settle(null); return; }   // you spoke again meanwhile
   if (!text || isBc || asrPending > (me.waited ? 1 : 0)) { if (spec === me) spec = null; me.settle(null); return; }  // (when waited, that one pending item is this very turn)
@@ -568,24 +573,52 @@ function cancelSpec() {
   spec = null;
 }
 
-// A finished utterance from the mic. Transcription runs strictly in order so text is never reordered or lost;
-// the bot answers once everything you said is transcribed and you've stopped talking.
-function handleUtterance(wav, backchannel = false, offset = null, knownText = null, specWait = null) {
-  asrPending++;
-  asrQueue = asrQueue.then(() => transcribe(wav, backchannel, offset, knownText, specWait)).finally(() => { asrPending--; maybeAnswer(); });
+// Transcribe a stretch of the mic stream. The server already receives the whole mic stream once a second, so only the sample range is sent
+// (after pushing out the last unsent bit); uploading the recording again used to take seconds on a slow link. Falls back to an upload.
+async function postAsr({ range, wav, kind = "user", log = 1, offset = null, knownText = null }) {
+  const mk = () => {
+    const fd = new FormData(); fd.append("kind", kind); fd.append("log", log);
+    if (offset != null) fd.append("offset", offset);
+    if (knownText != null) fd.append("known_text", knownText);
+    return fd;
+  };
+  if (range && !rec.broken) {
+    flushRec(); await rec.chain;
+    const fd = mk(); fd.append("range_start", range[0]); fd.append("range_end", range[1]);
+    const r = await fetch("/api/asr", { method: "POST", body: fd });
+    if (r.ok) return r.json();
+    if (r.status !== 409) throw new Error((await r.text()).slice(0, 300));
+    dbg("that part of the recording is not on the server → uploading the audio instead", "warn");
+  }
+  const fd = mk(); fd.append("audio", typeof wav === "function" ? wav() : wav, "utt.wav");
+  return (await api("/api/asr", { method: "POST", body: fd })).json();
 }
 
-async function transcribe(wav, backchannel, offset, knownText, specWait = null) {
+// A finished utterance from the mic. Transcription runs strictly in order so text is never reordered or lost;
+// the bot answers once everything you said is transcribed and you've stopped talking.
+function handleUtterance(wav, backchannel = false, offset = null, knownText = null, specWait = null, range = null) {
+  asrPending++;
+  asrQueue = asrQueue.then(() => transcribe(wav, backchannel, offset, knownText, specWait, range)).finally(() => { asrPending--; maybeAnswer(); });
+}
+
+async function transcribe(wav, backchannel, offset, knownText, specWait = null, range = null) {
   if (!backchannel) setStatus("Transcribing…");
   try {
     if (specWait) {  // the early transcription of this same speech was still running: use it (max 3 s), else transcribe normally
       knownText = await Promise.race([specWait, new Promise(r => setTimeout(() => r(null), 3000))]);
       dbg(knownText ? "waited for the early transcription → reused" : "early transcription failed → transcribing again", "bc");
     }
-    const fd = new FormData(); fd.append("audio", wav, "utt.wav"); fd.append("kind", backchannel ? "backchannel" : "user");
-    if (offset != null) fd.append("offset", offset);
-    if (knownText != null) fd.append("known_text", knownText);  // already transcribed while you paused: skip the model
-    const { text, backchannel: isBc } = await (await api("/api/asr", { method: "POST", body: fd })).json();
+    const kind = backchannel ? "backchannel" : "user";
+    if (knownText && !backchannel) {
+      // The early transcript is already here (and it is a real turn, not an aizuchi): answer now. Saving the audio for the log
+      // is done in the background so that it can never hold the reply back.
+      const t = knownText.trim();
+      addMsg("user", t); unanswered.push(t); contCount = 0;
+      dbg("early transcript used at once; the audio is saved in the background", "bc");
+      postAsr({ range, wav, kind, offset, knownText }).catch(e => dbg("saving your audio failed: " + e.message, "warn"));
+      return;
+    }
+    const { text, backchannel: isBc } = await postAsr({ range, wav, kind, offset, knownText });
     const asBc = backchannel || isBc;  // isBc: the transcript is only "…" or aizuchi words, so it is not a turn to answer
     dbg(`ASR (${backchannel ? "backchannel" : isBc ? "user → reclassified as backchannel" : "user"}): ${text ? JSON.stringify(text) : "empty — not logged"}`, asBc ? "bc" : "");
     if (text && asBc) addMsg("backchannel", text);   // shown only; doesn't trigger a reply
@@ -672,14 +705,15 @@ function encodeWav(frames, sr) {
 
 // Continuous recording of everything the mic hears: raw PCM is posted to the server about once a second
 // and appended to one long WAV. rec.total (samples since the recording started) lets log entries point into it.
-const rec = { buf: [], n: 0, total: 0, sr: 48000, start: true, chain: Promise.resolve() };
+const rec = { buf: [], n: 0, total: 0, sr: 48000, start: true, chain: Promise.resolve(), broken: false };
 function flushRec() {
   if (!rec.n) return;
   const pcm = new Int16Array(rec.n); let o = 0;
   for (const f of rec.buf) for (const x of f) pcm[o++] = Math.max(-1, Math.min(1, x)) * 32767;
   rec.buf = []; rec.n = 0;
-  const url = `/api/mic_chunk?sr=${rec.sr}&start=${rec.start ? 1 : 0}`; rec.start = false;
-  rec.chain = rec.chain.then(() => fetch(url, { method: "POST", body: pcm.buffer })).catch(() => {});  // in order, never blocks the UI
+  const url = `/api/mic_chunk?sr=${rec.sr}&start=${rec.start ? 1 : 0}`; if (rec.start) rec.broken = false; rec.start = false;
+  // A lost chunk would shift the sample numbers the server counts: from then on utterances are uploaded instead of read by range.
+  rec.chain = rec.chain.then(() => fetch(url, { method: "POST", body: pcm.buffer }).then(r => { if (!r.ok) rec.broken = true; })).catch(() => { rec.broken = true; });  // in order, never blocks the UI
 }
 
 function onFrame(f) {
@@ -712,7 +746,7 @@ function onFrame(f) {
   vad.quiet = heard ? 0 : vad.quiet + dur;
   if (SPEC_ON && !vad.overBot && !vad.specSent && vad.quiet >= SPEC_AT && vad.quiet < END_AFTER
       && vad.uttT - vad.quiet >= SPEC_MIN_SPEECH && asrPending === 0 && Date.now() - lastSpec > SPEC_COOLDOWN) {
-    vad.specSent = true; lastSpec = Date.now(); startSpec(vad.utt.slice(), micCtx.sampleRate);
+    vad.specSent = true; lastSpec = Date.now(); startSpec(vad.utt.slice(), micCtx.sampleRate, [vad.startSample, rec.total]);
   }
   if (FILLER_ON && !vad.overBot && !vad.fillerSent && vad.quiet >= FILLER_AT && vad.quiet < END_AFTER
       && vad.uttT - vad.quiet >= FILLER_MIN_SPEECH && Date.now() - lastFiller > FILLER_COOLDOWN) {
@@ -751,7 +785,7 @@ function onFrame(f) {
     }
     if (!backchannel && speech >= MIN_SPEECH) { turnEndAt = performance.now(); turnSpeech = speech; turnWait = quietAtEnd; }
     if (backchannel) handleUtterance(encodeWav(frames, sr), true, offset);
-    else if (speech >= MIN_SPEECH) handleUtterance(encodeWav(frames, sr), false, offset, specText, specWait);
+    else if (speech >= MIN_SPEECH) handleUtterance(() => encodeWav(frames, sr), false, offset, specText, specWait, range);
     else maybeAnswer();  // too short: noise
   }
 }
@@ -796,7 +830,7 @@ function stopListening() {
 }
 
 $("mic").onclick = async () => {
-  unlockAudio();
+  unlockAudio(); if (!listening) ttsWarm();
   try {
     if (listening) { scriptStop("conversation stopped"); bargeIn(); listening = false; $("llm").disabled = false; $("llm-note").textContent = ""; stopListening(); $("mic").textContent = "🎙 Start conversation"; $("mic").className = "primary"; setStatus(""); }
     else { await startListening(); listening = true; $("llm").disabled = true; $("llm-note").textContent = "(locked during conversation)"; $("mic").textContent = "⏹ Stop conversation"; $("mic").className = "rec"; setStatus("Listening…");
@@ -1343,7 +1377,7 @@ async function loadLlms() {
 }
 $("llm").onchange = () => { localStorage.setItem("llm", $("llm").value); dbg("LLM set to " + $("llm").value); };
 loadLlms().catch(e => setStatus("Could not load LLM list: " + e.message));
-loadModels().catch(e => setStatus("Could not load models: " + e.message));
+loadModels().then(() => ttsWarm()).catch(e => setStatus("Could not load models: " + e.message));
 </script>
 </body>
 </html>

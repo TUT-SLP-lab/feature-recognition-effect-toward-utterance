@@ -30,6 +30,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import librosa
+from math import gcd
+from scipy.signal import resample_poly
 import numpy as np
 import soundfile as sf
 import torch
@@ -253,6 +255,10 @@ log_q: queue.Queue = queue.Queue()
 log_lock = threading.Lock()
 session = {"dir": None, "kind": "normal", "n": {"human": 0, "ai": 0, "full": 0}}
 mic_rec = {"rel": None, "path": None, "sr": 0, "samples": 0, "ai_rel": None, "ai_path": None}
+# The last MIC_MEM_S seconds of the mic stream, kept in memory (the browser already streams it once a second), so an utterance can be
+# transcribed by sample range instead of uploading the whole recording again at every pause (that upload took seconds on a slow link).
+MIC_MEM_S = 150
+mic_mem: dict = {"chunks": [], "sr": 0}  # [(first sample index, int16 array)]; guarded by log_lock
 # ^ the continuous human recording being appended to, and the matching time-aligned AI track
 
 
@@ -479,6 +485,9 @@ def warmup():
             req = TTSRequest(text=text, model=model_id)
             _filler_cache[(req.model, req.style, req.style_weight, req.length, text)] = synth(req)
 
+    def stretch_step():  # the first time_stretch call of a process costs ~1.5 s (numba), which used to land on the first reply
+        lengthen_tail((np.random.randn(44100) * 1000).astype(np.int16), 44100)
+
     def llm_step(llm):
         for _ in llm_stream([turn("user", "こんにちは")], llm=llm):
             pass
@@ -486,6 +495,7 @@ def warmup():
     step("ASR", asr_step)
     step("TTS", tts_step)
     step("fillers", filler_step)
+    step("lengthening", stretch_step)
     for name, info in LLMS.items():
         if info["ok"]:
             step(f"LLM {name}", lambda name=name: llm_step(name))
@@ -556,8 +566,12 @@ async def api_mic_chunk(request: Request, sr: int, start: int = 0):
             rel, ai_rel = f"audio/human_full_{n:02d}.wav", f"audio/ai_full_{n:02d}.wav"
             mic_rec.update(rel=rel, path=session["dir"] / rel, sr=sr, samples=0,
                            ai_rel=ai_rel, ai_path=session["dir"] / ai_rel)
+            mic_mem.update(chunks=[], sr=sr)
             log_q.put(("mic_new", mic_rec["path"], sr))
+        mic_mem["chunks"].append((mic_rec["samples"], np.frombuffer(pcm, dtype=np.int16).copy()))
         mic_rec["samples"] += len(pcm) // 2
+        while mic_mem["chunks"] and mic_rec["samples"] - mic_mem["chunks"][0][0] > MIC_MEM_S * sr:
+            mic_mem["chunks"].pop(0)
         log_q.put(("mic", mic_rec["path"], pcm))
     return {"ok": True}
 
@@ -604,14 +618,42 @@ def is_backchannel_text(text: str, seconds: float) -> bool:
     return t == "" or (seconds <= 4 and bool(BACKCHANNEL_WORDS.fullmatch(t)))
 
 
+def mic_slice(start: int, end: int):
+    """Samples [start, end) of the current mic recording from memory, or None if they are not (all) there."""
+    with log_lock:
+        if end > mic_rec["samples"] or start < 0 or end <= start or not mic_mem["chunks"] or mic_mem["chunks"][0][0] > start:
+            return None
+        parts = [a[max(0, start - c0):end - c0] for c0, a in mic_mem["chunks"] if c0 < end and c0 + len(a) > start]
+    return np.concatenate(parts) if parts else None
+
+
+def to_16k(pcm: np.ndarray, sr: int) -> np.ndarray:
+    x = pcm.astype(np.float32) / 32768
+    if sr == 16000:
+        return x
+    g = gcd(sr, 16000)
+    return resample_poly(x, 16000 // g, sr // g).astype(np.float32)
+
+
 @app.post("/api/asr")
-def api_asr(audio: UploadFile = File(...), kind: str = Form("user"), offset: float | None = Form(None),
-            log: int = Form(1), known_text: str | None = Form(None)):
+def api_asr(audio: UploadFile | None = File(None), kind: str = Form("user"), offset: float | None = Form(None),
+            log: int = Form(1), known_text: str | None = Form(None),
+            range_start: int | None = Form(None), range_end: int | None = Form(None)):
+    # Either `audio` (a WAV upload) or range_start/range_end (sample indices into the mic stream the server already has).
     # kind: "user" | "backchannel"; offset: where this utterance starts in the continuous mic recording (seconds)
     # log=0: speculative transcription, don't record it; known_text: already transcribed speculatively, skip the model
     t0 = time.perf_counter()
-    raw = audio.file.read()
-    samples = decode_audio(raw)
+    raw = pcm = None
+    if audio is not None:
+        raw = audio.file.read()
+        samples = decode_audio(raw)
+    elif range_start is not None and range_end is not None:
+        pcm = mic_slice(range_start, range_end)
+        if pcm is None:
+            raise HTTPException(409, "that part of the recording is not on the server")  # the page then uploads the audio instead
+        samples = to_16k(pcm, mic_mem["sr"])
+    else:
+        raise HTTPException(400, "no audio")
     if len(samples) < 1600:  # < 0.1 s
         return {"text": ""}
     asr_ms = None
@@ -631,6 +673,8 @@ def api_asr(audio: UploadFile = File(...), kind: str = Form("user"), offset: flo
     if text and log:
         with log_lock:
             full = mic_rec["rel"]
+        if raw is None:  # taken from memory: write it as a WAV for the log
+            buf = io.BytesIO(); sf.write(buf, pcm, mic_mem["sr"], format="WAV", subtype="PCM_16"); raw = buf.getvalue()
         log_chat(kind, text, log_audio("human", raw), **({"reclassified": True} if reclassified else {}),
                  full_audio=full if offset is not None else None,
                  full_offset_s=round(offset, 3) if offset is not None and full else None,
@@ -966,6 +1010,21 @@ def api_filler(req: TTSRequest):
     return {"text": req.text, "audio": base64.b64encode(audio).decode(), "id": clip_id}
 
 
+class TtsWarm(BaseModel):
+    model: str
+    style: str = "Neutral"
+    style_weight: float = 5.0
+    length: float = 1.0
+
+
+@app.post("/api/tts_warm")
+def api_tts_warm(req: TtsWarm):
+    """Load a voice and run one short synthesis, so the first reply in that voice does not pay the ~1.3 s model load."""
+    t0 = time.perf_counter()
+    synth(TTSRequest(text="はい。", model=req.model, style=req.style, style_weight=req.style_weight, length=req.length))
+    return {"ms": round((time.perf_counter() - t0) * 1000)}
+
+
 @app.post("/api/tts")
 def api_tts(req: TTSRequest):
     t0 = time.perf_counter()
@@ -1116,13 +1175,15 @@ class LatencyEvent(BaseModel):
     silence_wait_s: float
     speech_s: float
     early_reply: bool
+    spec_asr_ms: int | None = None     # browser: time of the early transcription request (encode excluded)
+    spec_encode_ms: int | None = None  # browser: time to encode the recording as WAV
 
 
 @app.post("/api/latency")
 def api_latency(ev: LatencyEvent):
     """The page measured how long after the turn was judged over the first sound of the reply started."""
     log_chat("event", "reply latency", latency_ms=ev.latency_ms, silence_wait_s=ev.silence_wait_s,
-             speech_s=ev.speech_s, early_reply=ev.early_reply,
+             speech_s=ev.speech_s, early_reply=ev.early_reply, spec_asr_ms=ev.spec_asr_ms, spec_encode_ms=ev.spec_encode_ms,
              from_last_word_s=round(ev.latency_ms / 1000 + ev.silence_wait_s, 2))
     return {"ok": True}
 
