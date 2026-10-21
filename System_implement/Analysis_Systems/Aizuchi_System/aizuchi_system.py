@@ -1010,6 +1010,40 @@ def api_filler(req: TTSRequest):
     return {"text": req.text, "audio": base64.b64encode(audio).decode(), "id": clip_id}
 
 
+# Per-voice settings (style, style weight, speed): voices differ in how fast they speak, so each remembers its own.
+# Kept in a file next to the server (not in the browser) so every browser and computer uses the same values.
+VOICE_SETTINGS_PATH = HERE / "voice_settings.json"
+_voice_lock = threading.Lock()
+
+
+def read_voice_settings() -> dict:
+    try:
+        return json.loads(VOICE_SETTINGS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+class VoiceSetting(BaseModel):
+    model: str
+    style: str
+    style_weight: float
+    length: float
+
+
+@app.get("/api/voice_settings")
+def api_voice_settings_get():
+    return read_voice_settings()
+
+
+@app.post("/api/voice_settings")
+def api_voice_settings_set(v: VoiceSetting):
+    with _voice_lock:
+        d = read_voice_settings()
+        d[v.model] = {"style": v.style, "style_weight": v.style_weight, "length": v.length}
+        VOICE_SETTINGS_PATH.write_text(json.dumps(d, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return {"ok": True}
+
+
 class TtsWarm(BaseModel):
     model: str
     style: str = "Neutral"

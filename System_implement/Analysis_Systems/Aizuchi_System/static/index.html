@@ -342,7 +342,23 @@ async function loadModels() {
   $("model").innerHTML = models.map(m => `<option value="${m.id}">${m.name} — ${m.checkpoint}</option>`).join("");
   const saved = localStorage.getItem("sbv2_model");
   if (saved && models.some(m => m.id === saved)) $("model").value = saved;
-  fillStyles();
+  try { voiceSettings = await (await api("/api/voice_settings")).json(); } catch (e) { voiceSettings = {}; }
+  fillStyles(); applyVoice();
+}
+// Each voice remembers its own style, style weight and speed (voices differ in how fast they speak). Stored on the server, so it is the
+// same in every browser. A voice with nothing saved starts from the defaults, not from the previous voice's values.
+let voiceSettings = {}, voiceSaveTimer = null;
+function applyVoice() {
+  const v = voiceSettings[$("model").value] || { style: "Neutral", style_weight: 5, length: 0.85 };
+  if ([...$("style").options].some(o => o.value === v.style)) $("style").value = v.style;
+  $("sw").value = v.style_weight; $("swv").textContent = (+$("sw").value).toFixed(1);
+  $("len").value = v.length; $("lenv").textContent = (+$("len").value).toFixed(2);
+}
+function saveVoice() {
+  const body = { model: $("model").value, style: $("style").value, style_weight: +$("sw").value, length: +$("len").value };
+  voiceSettings[body.model] = { style: body.style, style_weight: body.style_weight, length: body.length };
+  clearTimeout(voiceSaveTimer);
+  voiceSaveTimer = setTimeout(() => fetch("/api/voice_settings", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body) }).catch(() => {}), 400);
 }
 function fillStyles() {
   const m = models.find(m => m.id === $("model").value);
@@ -351,9 +367,10 @@ function fillStyles() {
 // Load the chosen voice now (a first reply in a voice that is not loaded yet takes ~1.3 s longer).
 const ttsWarm = () => fetch("/api/tts_warm", { method: "POST", headers: {"Content-Type": "application/json"},
   body: JSON.stringify({ model: $("model").value, style: $("style").value, style_weight: +$("sw").value, length: +$("len").value }) }).catch(() => {});
-$("model").onchange = () => { localStorage.setItem("sbv2_model", $("model").value); fillStyles(); ttsWarm(); };
-$("sw").oninput = () => $("swv").textContent = (+$("sw").value).toFixed(1);
-$("len").oninput = () => $("lenv").textContent = (+$("len").value).toFixed(2);
+$("model").onchange = () => { localStorage.setItem("sbv2_model", $("model").value); fillStyles(); applyVoice(); ttsWarm(); };
+$("style").onchange = saveVoice;
+$("sw").oninput = () => { $("swv").textContent = (+$("sw").value).toFixed(1); saveVoice(); };
+$("len").oninput = () => { $("lenv").textContent = (+$("len").value).toFixed(2); saveVoice(); };
 
 // Play a silent clip inside a click handler so the browser lets later playback through.
 const SILENT_WAV = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=";
