@@ -120,10 +120,10 @@
     </label>
     <button id="script-restart">↻ Restart script from block 1</button>
     <label>Free-talk replies after each question
-      <input id="script-rounds" type="number" min="1" max="4" step="1" value="2" style="width:70px">
+      <input id="script-rounds" type="number" min="1" max="4" step="1" value="3" style="width:70px">
     </label>
     <label>Wait for an answer (s)
-      <input id="script-wait" type="number" min="3" max="60" step="1" value="12" style="width:80px">
+      <input id="script-wait" type="number" min="3" max="60" step="1" value="8" style="width:80px">
     </label>
     <span id="script-status" style="color:var(--muted);font-size:13px">Press “Start conversation”: the chosen script starts by itself (files in the scripts folder)</span>
   </section>
@@ -521,7 +521,7 @@ async function chatTurn(cont = false) {
     s = startStream(text, false, cont);
   }
   chatCtrl = s.ctrl;
-  if (script.on && (script.phase === "question" || script.phase === "freetalk")) {
+  if (script.on && (script.phase === "question" || script.phase === "freetalk" || script.phase === "reaction")) {   // "reaction" = you spoke over the previous reply: that reply counts as a round
     script.ft++; script.phase = "reaction"; scriptStatus(`block ${script.block + 1}: free talk, reply ${script.ft} of ${script.rounds}`);
   }
   setStatus(s.got ? "Speaking…" : "Thinking…");
@@ -538,7 +538,7 @@ async function chatTurn(cont = false) {
     if (chatCtrl === s.ctrl) chatCtrl = null;
     if (failed) setTimeout(() => { if ($("status").textContent.startsWith("Error")) setStatus(idleStatus()); }, 10000);  // keep the error visible
     else if (!s.ctrl.signal.aborted) setStatus(idleStatus());
-    if (script.on && !failed && !s.ctrl.signal.aborted) scriptAfterReply();
+    if (script.on && !failed && !s.ctrl.signal.aborted) scriptAfterReply(s.bubble ? s.bubble.textContent : "");
   }
 }
 
@@ -639,7 +639,14 @@ async function transcribe(wav, backchannel, offset, knownText, specWait = null, 
     const { text, backchannel: isBc } = await postAsr({ range, wav, kind, offset, knownText });
     const asBc = backchannel || isBc;  // isBc: the transcript is only "…" or aizuchi words, so it is not a turn to answer
     dbg(`ASR (${backchannel ? "backchannel" : isBc ? "user → reclassified as backchannel" : "user"}): ${text ? JSON.stringify(text) : "empty — not logged"}`, asBc ? "bc" : "");
-    if (text && asBc) addMsg("backchannel", text);   // shown only; doesn't trigger a reply
+    // Right after a question (or a free-talk question), a short sound like "うん" / "はい" / "…" IS the answer, not an aizuchi to ignore.
+    const awaitingAnswer = script.on && (script.phase === "question" || script.phase === "freetalk") && !backchannel && !chatCtrl && !playing && !queue.length;
+    if (text && isBc && awaitingAnswer) {
+      const t = text.replace(/[…\s。、，．,.！？!?・〜~ー]/g, "") ? text : "うん";   // nothing readable: treat it as a nod
+      addMsg("user", t); unanswered.push(t); contCount = 0;
+      scriptEvent(`a short sound was counted as the answer: ${JSON.stringify(text)}`);
+    }
+    else if (text && asBc) addMsg("backchannel", text);   // shown only; doesn't trigger a reply
     else if (text) { addMsg("user", text); unanswered.push(text); contCount = 0; }
   } catch (e) { setStatus("Error: " + e.message); }
 }
@@ -975,14 +982,14 @@ $("pv").addEventListener("mousemove", () => { $("pv").classList.remove("idle"); 
 // ---------- fixed story script (files in the scripts folder) ----------
 // A block = story units (each followed by a slot for aizuchi) + a question. The story is spoken as written; the LLM only
 // reacts to the answer to a question, or answers an interjection, after which the script carries on.
-const script = { on: false, blocks: [], block: 0, unit: 0, phase: "idle", epoch: 0, playingUnit: -1, ctrl: null, answerWait: 12,
-                 rounds: 2, ft: 0, hasBridge: false, bridgeNext: false };  // rounds = LLM replies after each question (free talk); ft = replies so far
+const script = { on: false, blocks: [], block: 0, unit: 0, phase: "idle", epoch: 0, playingUnit: -1, ctrl: null, answerWait: 8,
+                 rounds: 3, ft: 0, hasBridge: false, bridgeNext: false };  // rounds = LLM replies after each question (free talk); ft = replies so far
 // What the LLM is asked to do right now: follow up on the answer with a question, close with a short reaction, or answer an interjection.
 function scriptTalkMode() {
   if (!script.on) return "";
   if (script.phase === "playing") return "answer";
   if (script.phase === "question") return script.rounds > 1 ? "followup" : "close";
-  if (script.phase === "freetalk") return script.ft + 1 < script.rounds ? "followup" : "close";
+  if (script.phase === "freetalk" || script.phase === "reaction") return script.ft + 1 < script.rounds ? "followup" : "close";
   return "close";
 }
 const scriptBusy = () => script.on && script.phase === "playing";  // reading story units: speech over it is an aizuchi unless it lasts
@@ -1019,7 +1026,7 @@ async function scriptBegin() {  // called when the conversation starts in the Sc
     if (d.error || !d.blocks.length) { const m = (d.file || "script") + ": " + (d.error || "no blocks"); scriptStatus(m); scriptEvent("script failed to start: " + m, null); return; }
     d.warnings.forEach(w => dbg("script: " + w, "warn"));
     script.blocks = d.blocks; script.answerWait = +$("script-wait").value;
-    script.rounds = Math.max(1, Math.min(4, +$("script-rounds").value || 2)); script.ft = 0; script.bridgeNext = false; script.hasBridge = !!d.bridge;
+    script.rounds = Math.max(1, Math.min(4, +$("script-rounds").value || 3)); script.ft = 0; script.bridgeNext = false; script.hasBridge = !!d.bridge;
     Object.assign(script, { on: true, block: 0, unit: 0, playingUnit: -1 });
     unanswered.length = 0; botSpoke = true; contCount = 0;
     scriptEvent(`script started: ${d.file}`, undefined, settingsSnapshot()); scriptPlay();
@@ -1096,8 +1103,11 @@ function scriptOnBarge() {
   }
 }
 // The LLM finished answering: carry on with the script.
-function scriptAfterReply() {
+function scriptAfterReply(replyText = "") {
   if (script.phase === "reaction") {
+    if (script.ft < script.rounds && !/[？?]/.test(replyText)) {   // the LLM was to ask a question but did not: there is nothing for the user to answer, so do not wait
+      scriptEvent(`the free-talk reply asked no question, so the script goes on (${script.ft} of ${script.rounds} replies)`); scriptNext(); return;
+    }
     if (script.ft < script.rounds) {   // more free talk: wait for the user's next turn
       script.phase = "freetalk"; scriptStatus(`block ${script.block + 1}: free talk, waiting for you`); scriptEvent(`free talk: reply ${script.ft} of ${script.rounds} done, waiting for the user`);
     } else scriptNext();
