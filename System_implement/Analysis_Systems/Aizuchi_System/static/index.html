@@ -251,6 +251,9 @@
         <input id="dbg-spec-on" type="checkbox" checked> Start LLM early (speculative reply)
       </label>
       <label style="flex-direction:row;align-items:center;gap:6px;color:var(--text);font-size:14px">
+        <input id="dbg-keepawake" type="checkbox" checked> Keep the audio output awake (avoids a clipped first syllable)
+      </label>
+      <label style="flex-direction:row;align-items:center;gap:6px;color:var(--text);font-size:14px">
         <input id="dbg-hes-on" type="checkbox" checked> Wait longer after a hesitation (なんか, えーと, 〜て、…)
       </label>
       <label>Extra wait after a hesitation (s)
@@ -863,15 +866,28 @@ function stopListening() {
   micCtx.close(); micCtx = micStream = null; $("lvl").value = 0;
 }
 
-$("mic").onclick = async () => {
-  unlockAudio(); if (!listening) ttsWarm();
+// Keep the audio output awake while a conversation runs. A sound card / Bluetooth headset that has been idle takes a moment to start, which can
+// swallow the first syllable of a reply ("この前" heard as "の前"). A near-silent (-80 dB) looping sound keeps the output running; it costs no latency.
+let KEEP_AWAKE = true, keepAwake = null;
+function startKeepAwake() {
+  if (!KEEP_AWAKE || keepAwake) return;
   try {
-    if (listening) { scriptStop("conversation stopped"); bargeIn(); listening = false; $("llm").disabled = false; $("llm-note").textContent = ""; stopListening(); $("mic").textContent = "🎙 Start conversation"; $("mic").className = "primary"; setStatus(""); }
+    const ctx = new (window.AudioContext || window.webkitAudioContext)(); ctx.resume().catch(() => {});
+    const b = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate), d = b.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * 1e-4;   // not exact zero: some systems switch the output off on digital silence
+    const s = ctx.createBufferSource(); s.buffer = b; s.loop = true; s.connect(ctx.destination); s.start(); keepAwake = { ctx, s };
+  } catch (e) { keepAwake = null; }
+}
+function stopKeepAwake() { if (!keepAwake) return; try { keepAwake.s.stop(); keepAwake.ctx.close(); } catch (e) {} keepAwake = null; }
+$("mic").onclick = async () => {
+  unlockAudio(); if (!listening) { ttsWarm(); startKeepAwake(); }
+  try {
+    if (listening) { stopKeepAwake(); scriptStop("conversation stopped"); bargeIn(); listening = false; $("llm").disabled = false; $("llm-note").textContent = ""; stopListening(); $("mic").textContent = "🎙 Start conversation"; $("mic").className = "primary"; setStatus(""); }
     else { await startListening(); listening = true; $("llm").disabled = true; $("llm-note").textContent = "(locked during conversation)"; $("mic").textContent = "⏹ Stop conversation"; $("mic").className = "rec"; setStatus("Listening…");
       scriptEvent(`conversation started in ${convMode} mode`, null, settingsSnapshot());   // marks every log with its mode
       if (convMode === "script") scriptBegin(); }  // the Script tab starts its script by itself
   } catch (e) {
-    setStatus("Mic error: " + e.message); dbg("mic error: " + e.message, "warn"); scriptEvent("mic error: " + e.message, null);
+    stopKeepAwake(); setStatus("Mic error: " + e.message); dbg("mic error: " + e.message, "warn"); scriptEvent("mic error: " + e.message, null);
     if (!$("pv").hidden) { $("pv-msg").textContent = "マイクを使えません: " + e.message; $("pv-msg").hidden = false; $("pv-start").hidden = false; }  // the participant view shows no status line
   }
 };
@@ -1043,7 +1059,7 @@ function settingsSnapshot() {
   return { tts_model: $("model").value, tts_style: $("style").value, tts_style_weight: +$("sw").value, tts_length: +$("len").value, llm: $("llm").value,
            script_file: convMode === "script" ? $("script-file").value || null : null, free_talk_rounds: convMode === "script" ? +$("script-rounds").value : null,
            pause_phrase_ms: PAUSE_MS, pause_sentence_ms: PAUSE_END_MS, barge_after_s: BARGE_AFTER, end_after_s: END_AFTER, spec_at_s: SPEC_AT,
-           hesitation_rule: HES_ON, hesitation_extra_s: HES_EXTRA, stretch_jitter: STRETCH_JITTER, stretch_table: STRETCH_TABLE };
+           keep_audio_awake: KEEP_AWAKE, hesitation_rule: HES_ON, hesitation_extra_s: HES_EXTRA, stretch_jitter: STRETCH_JITTER, stretch_table: STRETCH_TABLE };
 }
 function scriptStop(why) {
   if (!script.on && script.phase === "idle") return;
@@ -1384,6 +1400,7 @@ $("dbg-barge").onchange = () => BARGE_AFTER = +$("dbg-barge").value;
 $("dbg-end").onchange = () => END_AFTER = +$("dbg-end").value;
 $("dbg-spec-at").onchange = () => SPEC_AT = +$("dbg-spec-at").value;
 $("dbg-hes-on").onchange = () => HES_ON = $("dbg-hes-on").checked;
+$("dbg-keepawake").onchange = () => { KEEP_AWAKE = $("dbg-keepawake").checked; if (!KEEP_AWAKE) stopKeepAwake(); else if (listening) startKeepAwake(); };
 $("dbg-hes-extra").onchange = () => HES_EXTRA = +$("dbg-hes-extra").value;
 $("dbg-spec-on").onchange = () => SPEC_ON = $("dbg-spec-on").checked;
 $("dbg-filler-at").onchange = () => FILLER_AT = +$("dbg-filler-at").value;
