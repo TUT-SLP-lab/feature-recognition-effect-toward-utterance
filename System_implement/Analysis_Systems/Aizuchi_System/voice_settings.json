@@ -1,0 +1,27 @@
+{
+  "jvnv-F1-jp/jvnv-F1-jp_e160_s14000.safetensors": {
+    "length": 0.9,
+    "style": "Neutral",
+    "style_weight": 5.0
+  },
+  "jvnv-F2-jp/jvnv-F2_e166_s20000.safetensors": {
+    "length": 0.9,
+    "style": "Neutral",
+    "style_weight": 5.0
+  },
+  "jvnv-M1-jp/jvnv-M1-jp_e158_s14000.safetensors": {
+    "length": 0.9,
+    "style": "Neutral",
+    "style_weight": 5.0
+  },
+  "jvnv-M2-jp/jvnv-M2-jp_e159_s17000.safetensors": {
+    "length": 0.9,
+    "style": "Neutral",
+    "style_weight": 5.0
+  },
+  "koharune-ami/koharune-ami.safetensors": {
+    "length": 1.0,
+    "style": "Neutral",
+    "style_weight": 5.0
+  }
+}
