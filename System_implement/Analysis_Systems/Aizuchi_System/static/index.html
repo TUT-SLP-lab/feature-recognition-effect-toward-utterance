@@ -1079,8 +1079,12 @@ async function scriptPlay() {
 }
 function scriptNext(why) {
   if (!script.on) return;
-  script.bridgeNext = script.ft > 0; script.ft = 0;   // after a free talk the optional bridge line leads back into the script
+  // The optional bridge line leads back into the story after a question block (answered or not), but not into the outro.
+  const prev = script.blocks[script.block], hadQuestion = !!prev && prev.units[prev.units.length - 1].kind === "question";
+  script.ft = 0;
   script.phase = "between"; script.block++; script.unit = 0; script.playingUnit = -1;
+  const nxt = script.blocks[script.block];
+  script.bridgeNext = hadQuestion && !!nxt && nxt.units[0].kind !== "outro";
   if (script.block >= script.blocks.length) {
     scriptEvent("script finished"); scriptStop("script finished");
     // the outro has been spoken (scriptPlay waits for the audio to end): end the conversation too

@@ -1,6 +1,6 @@
 {
   "title": "Taiwan trip (Taipei, night market, Jiufen)",
-  "_note": "Markers: |S = strong cue (long slot, strong lengthening), |W = weak cue (short pause, weak lengthening); they are never spoken. 'question' is the handoff after a block.",
+  "_note": "Markers: |S = strong cue (long slot, strong lengthening), |W = weak cue (short pause, weak lengthening); they are never spoken. 'question' is the handoff after a block. 'bridge' is spoken after the free talk, before the next story block (not before the outro).",
   "blocks": [
     {
       "id": "taipei",
@@ -31,5 +31,6 @@
       "question": "旅行のとき、夜の街をぶらぶら歩くのは好きですか？"
     }
   ],
+  "bridge": "それじゃあ、話の続きなんですけど、",
   "outro": "最後まで聞いてくださって、ありがとうございました。"
 }
