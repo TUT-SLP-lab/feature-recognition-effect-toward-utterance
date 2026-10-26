@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pitch and speech rate</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1d2129; --muted:#6b7280; --line:#d8dce2; --accent:#2563eb; --p:#2563eb; --s:#d97706; --o:#16a34a; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#12151a; --card:#1b2028; --text:#e6e9ef; --muted:#8b93a1; --line:#2c3440; --accent:#6ea0ff; --p:#6ea0ff; --s:#f59e0b; --o:#4ade80; } }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 system-ui, "Hiragino Sans", "Noto Sans JP", sans-serif; }
+  main { max-width:1400px; margin:0 auto; padding:14px 16px 40px; display:grid; gap:12px; grid-template-columns:minmax(0,1fr); }
+  h1 { font-size:18px; margin:0; } h2 { font-size:15px; margin:0 0 8px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px; }
+  .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+  button, select, input { font:inherit; color:var(--text); background:var(--card); border:1px solid var(--line); border-radius:8px; padding:6px 10px; }
+  button { cursor:pointer; } button.primary { background:var(--accent); color:#fff; border-color:transparent; } button:disabled { opacity:.5; cursor:wait; }
+  input[type=number] { width:70px; } .muted { color:var(--muted); font-size:12px; }
+  .slot { display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:4px 0; }
+  .badge { width:26px; height:26px; border-radius:50%; background:var(--accent); color:#fff; font-weight:700; display:inline-flex; align-items:center; justify-content:center; flex:none; }
+  .slot select { min-width:260px; } .slot input[type=text] { width:150px; }
+  #status.err { color:#dc2626; }
+  table { border-collapse:collapse; } .cmp { width:100%; } .cmp th, .cmp td { padding:4px 10px; border-bottom:1px solid var(--line); text-align:left; }
+  .cmp th { color:var(--muted); font-size:12px; font-weight:600; } .cmp td.l { color:var(--muted); white-space:nowrap; }
+  .cell { position:relative; min-width:90px; font-variant-numeric:tabular-nums; font-weight:600; }
+  .cell i { position:absolute; left:0; top:2px; bottom:2px; background:var(--accent); opacity:.14; border-radius:3px; } .cell span { position:relative; }
+  .cell.best span { color:var(--accent); } .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:6px; }
+  canvas { width:100%; display:block; cursor:pointer; }
+  .panel { margin-bottom:6px; } .panel .cap { display:flex; gap:8px; align-items:center; margin:2px 0; }
+  .tbl { overflow:auto; max-height:480px; } .t { width:100%; } .t th, .t td { border-bottom:1px solid var(--line); padding:3px 8px; text-align:left; white-space:nowrap; font-variant-numeric:tabular-nums; }
+  .t th { position:sticky; top:0; background:var(--card); color:var(--muted); font-size:12px; cursor:pointer; user-select:none; }
+  .t tbody tr { cursor:pointer; } .t tr.sel td { background:#2563eb22; } .t td.txt { white-space:normal; min-width:200px; }
+  #results { display:contents; } #results[hidden] { display:none; }
+  .legend span { margin-right:12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Pitch and speech rate <span class="muted">— compare 2 to 4 conversations side by side</span></h1>
+
+  <section class="card">
+    <div id="slots"></div>
+    <div class="row" style="margin-top:6px">
+      <button id="add">+ Add conversation</button>
+      <button id="run" class="primary">Analyze and compare</button>
+      <label>Pitch range <input id="fmin" type="number" value="65"> – <input id="fmax" type="number" value="500"> Hz</label>
+      <span class="muted">Low voices 65–300, high voices 100–500; a wrong range gives octave errors.</span>
+      <label title="leave out backchannels and aizuchi you marked by ear"><input type="checkbox" id="noaiz" checked> exclude aizuchi</label>
+      <span id="status" class="muted"></span>
+    </div>
+  </section>
+
+  <div id="results" hidden>
+    <section class="card"><h2>Summary <span class="muted">(median per speaker; the bar is relative to the largest value in the row, blue = highest)</span></h2><div id="summary"></div></section>
+
+    <section class="card">
+      <div class="row" style="justify-content:space-between">
+        <h2 style="margin:0">Distribution of utterances <span class="muted">(each dot = one utterance, line = median)</span></h2>
+        <span class="row"><label>Measure <select id="metric"></select></label><label>Speaker <select id="dspk"></select></label></span>
+      </div>
+      <canvas id="strip"></canvas>
+    </section>
+
+    <section class="card">
+      <div class="row" style="justify-content:space-between">
+        <h2 style="margin:0">Pitch over time <span class="muted">(same vertical scale in every panel; click a curve to play it)</span></h2>
+        <span class="row"><label>Axis <select id="unit"><option value="hz">Hz</option><option value="st">semitones from speaker median</option></select></label>
+        <label><input type="checkbox" id="sameT" checked> same time scale</label></span>
+      </div>
+      <div class="legend muted" id="legend"></div>
+      <div id="panels"></div>
+    </section>
+
+    <section class="card">
+      <div class="row" style="justify-content:space-between"><h2 style="margin:0">Utterances</h2>
+        <span class="row"><label>Conversation <select id="fconv"></select></label><label>Speaker <select id="fspk"></select></label><button id="csv">Download CSV</button></span></div>
+      <div class="tbl"><table class="t"><thead id="thead"></thead><tbody id="tbody"></tbody></table></div>
+    </section>
+  </div>
+  <audio id="audio"></audio>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const L4 = "ABCD";
+const METRICS = [["f0_median","F0 median (Hz)"],["f0_range_st","F0 range (semitones)"],["f0_sd_st","F0 sd (semitones)"],["end_slope_st_s","Ending slope (st/s, + rising)"],
+  ["mora_s","Speech rate (morae/s, from text)"],["artic_mora_s","Articulation rate (morae/s, no pauses)"],["rate_syll_s","Rate, acoustic estimate (syl/s)"],["artic_syll_s","Articulation, acoustic estimate (syl/s)"],["dur_s","Utterance length (s)"],["pause_s","Pause inside utterance (s)"]];
+const COLS = [["conv","conv"],["speaker","speaker"],["kind","kind"],["aizuchi","aizuchi"],["start_s","start s"],["dur_s","dur s"],["f0_median","F0 Hz"],["f0_range_st","range st"],["f0_sd_st","sd st"],
+  ["end_slope_st_s","end st/s"],["mora","morae"],["mora_s","mora/s"],["artic_mora_s","artic mora/s"],["rate_syll_s","est. syl/s"],["pause_s","pause s"],["voiced_share","voiced"],["text","text"]];
+let sessions = [], slots = [], convs = [], sel = null, stopAt = 0, hits = [], sortKey = "start_s", sortDir = 1;
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const median = a => { a = a.filter(x => x != null).sort((x, y) => x - y); const m = a.length >> 1; return a.length ? (a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2) : null; };
+const spkColor = s => css(s === "system" || s === "channel 2" ? "--s" : s === "participant" || s === "channel 1" || s === "speaker" ? "--p" : "--o");
+const status = (t, err) => { $("status").textContent = t; $("status").className = err ? "err muted" : "muted"; };
+const rowsOf = c => c.rows.filter(r => !$("noaiz").checked || !r.aizuchi);
+const label = (c, i) => `${L4[i]}${c.label ? " · " + c.label : ""}`;
+
+/* ---------- conversation slots ---------- */
+function renderSlots() {
+  $("slots").innerHTML = "";
+  slots.forEach((s, i) => {
+    const d = document.createElement("div"); d.className = "slot";
+    d.innerHTML = `<span class="badge">${L4[i]}</span>
+      <select>${sessions.map(x => `<option ${!s.file && x === s.session ? "selected" : ""}>${x}</option>`).join("")}${s.file ? `<option selected value="__file">📁 ${s.file.name}</option>` : ""}</select>
+      <button>or choose an audio file…</button><input type="file" accept="audio/*,.wav,.mp3,.m4a,.flac,.ogg" hidden>
+      <input type="text" placeholder="label (e.g. female voice)" value="${s.label || ""}">
+      ${slots.length > 2 ? `<button class="x" title="remove">✕</button>` : ""}`;
+    const [sel_, btn, file, lab] = d.querySelectorAll("select, button:not(.x), input[type=file], input[type=text]");
+    sel_.onchange = () => { if (sel_.value !== "__file") { s.session = sel_.value; s.file = null; } };
+    btn.onclick = () => file.click();
+    file.onchange = () => { if (file.files[0]) { s.file = file.files[0]; renderSlots(); } };
+    lab.oninput = () => s.label = lab.value;
+    const x = d.querySelector(".x"); if (x) x.onclick = () => { slots.splice(i, 1); renderSlots(); };
+    $("slots").appendChild(d);
+  });
+  $("add").disabled = slots.length >= 4;
+}
+$("add").onclick = () => { if (slots.length < 4) { slots.push({ session: sessions[slots.length] || sessions[0], file: null, label: "" }); renderSlots(); } };
+fetch("/api/sessions").then(r => r.json()).then(l => { sessions = l; slots = [0, 1].map(i => ({ session: l[i] || l[0], file: null, label: "" })); renderSlots(); });
+
+/* ---------- analysis ---------- */
+async function analyzeSlot(s) {
+  const q = `fmin=${$("fmin").value}&fmax=${$("fmax").value}`;
+  let r, audio;
+  if (s.file) {
+    const fd = new FormData(); fd.append("file", s.file); fd.append("fmin", $("fmin").value); fd.append("fmax", $("fmax").value);
+    r = await fetch("/api/analyze_file", { method: "POST", body: fd }); audio = URL.createObjectURL(s.file);
+  } else { r = await fetch(`/api/analyze_session?path=${encodeURIComponent(s.session)}&${q}`, { method: "POST" }); }
+  if (!r.ok) throw new Error(s.file ? s.file.name + ": " + ((await r.json().catch(() => ({}))).detail || r.statusText) : s.session + ": " + r.statusText);
+  const j = await r.json();
+  return { name: s.file ? s.file.name : s.session, label: s.label, rows: j.rows, audio: audio || j.audio };
+}
+$("run").onclick = async () => {
+  document.querySelectorAll("button").forEach(b => b.disabled = true);
+  status(`Analyzing ${slots.length} conversations … (about 20 s each, in parallel)`);
+  try {
+    convs = await Promise.all(slots.map(analyzeSlot));
+    convs.forEach((c, ci) => c.rows.forEach((r, i) => { r.conv = L4[ci]; r._c = ci; r._i = i; }));
+    sel = null; status(convs.map((c, i) => `${L4[i]}: ${c.rows.length} utterances (${c.rows.filter(r => r.aizuchi).length} aizuchi)`).join("   "));
+    show();
+  } catch (e) { status(String(e.message || e), true); }
+  finally { document.querySelectorAll("button").forEach(b => b.disabled = false); $("add").disabled = slots.length >= 4; }
+};
+
+/* ---------- views ---------- */
+const speakers = () => [...new Set(convs.flatMap(c => rowsOf(c).map(r => r.speaker)))];
+function show() {
+  $("results").hidden = false;
+  const spk = speakers();
+  $("metric").innerHTML = METRICS.map(([k, l]) => `<option value="${k}">${l}</option>`).join("");
+  $("metric").value = "f0_median";
+  $("dspk").innerHTML = spk.map(s => `<option>${s}</option>`).join("");
+  $("fconv").innerHTML = `<option value="">all</option>` + convs.map((c, i) => `<option value="${i}">${label(c, i)}</option>`).join("");
+  $("fspk").innerHTML = `<option value="">all</option>` + spk.map(s => `<option>${s}</option>`).join("");
+  $("legend").innerHTML = spk.map(s => `<span><span class="dot" style="background:${spkColor(s)}"></span>${s}</span>`).join("");
+  summary(); strip(); panels(); table();
+}
+function summary() {
+  $("summary").innerHTML = speakers().map(s => {
+    const head = convs.map((c, i) => `<th>${label(c, i)}<div class="muted" style="font-weight:400">${rowsOf(c).filter(r => r.speaker === s).length} utterances</div></th>`).join("");
+    const body = METRICS.slice(0, 8).map(([k, l]) => {
+      const v = convs.map(c => median(rowsOf(c).filter(r => r.speaker === s).map(r => r[k])));
+      if (v.every(x => x == null)) return "";
+      const ok = v.filter(x => x != null), mx = Math.max(...ok.map(Math.abs)) || 1, top = ok.length > 1 && k !== "end_slope_st_s" ? Math.max(...ok) : null;
+      return `<tr><td class="l">${l}</td>` + v.map(x => x == null ? `<td class="cell muted">–</td>` :
+        `<td class="cell ${x === top ? "best" : ""}">${k === "end_slope_st_s" ? "" : `<i style="width:${Math.abs(x) / mx * 100}%"></i>`}<span>${x.toFixed(2)}</span></td>`).join("") + "</tr>";
+    }).join("");
+    return `<h2 style="margin-top:8px"><span class="dot" style="background:${spkColor(s)}"></span>${s}</h2><table class="cmp"><thead><tr><th></th>${head}</tr></thead><tbody>${body}</tbody></table>`;
+  }).join("");
+}
+function fit(cv, h) { const d = devicePixelRatio || 1, W = cv.clientWidth; cv.style.height = h + "px"; cv.width = W * d; cv.height = h * d; const g = cv.getContext("2d"); g.scale(d, d); g.font = "11px system-ui"; return [g, W, h]; }
+function strip() {
+  const k = $("metric").value, s = $("dspk").value, cv = $("strip");
+  const vals = convs.map(c => rowsOf(c).filter(r => r.speaker === s && r[k] != null).map(r => r[k]));
+  const all = vals.flat(); const [g, W, H] = fit(cv, 40 + convs.length * 52);
+  if (!all.length) { g.fillStyle = css("--muted"); g.fillText("no data for this speaker / measure", 10, 20); return; }
+  const lo = Math.min(...all), hi = Math.max(...all), pad = (hi - lo) * .06 || 1, Lm = 150, R = 14;
+  const X = v => Lm + (v - lo + pad) / (hi - lo + 2 * pad) * (W - Lm - R);
+  g.strokeStyle = css("--line"); g.fillStyle = css("--muted"); g.textAlign = "center";
+  for (let t = 0; t <= 5; t++) { const v = lo - pad + (hi - lo + 2 * pad) * t / 5, x = X(v); g.beginPath(); g.moveTo(x, 4); g.lineTo(x, H - 18); g.stroke(); g.fillText(v.toFixed(1), x, H - 4); }
+  convs.forEach((c, i) => {
+    const y = 8 + i * 52 + 22; g.fillStyle = css("--text"); g.textAlign = "right"; g.fillText(label(c, i).slice(0, 24), Lm - 10, y + 4);
+    g.fillStyle = spkColor(s);
+    vals[i].forEach((v, j) => { g.globalAlpha = .55; g.beginPath(); g.arc(X(v), y + ((j * 7919) % 21) - 10, 4, 0, 7); g.fill(); });
+    g.globalAlpha = 1;
+    if (vals[i].length) { const m = median(vals[i]); g.strokeStyle = css("--text"); g.lineWidth = 2.5; g.beginPath(); g.moveTo(X(m), y - 18); g.lineTo(X(m), y + 18); g.stroke(); g.lineWidth = 1; g.textAlign = "left"; g.fillStyle = css("--text"); g.fillText(m.toFixed(2), X(m) + 5, y - 14); }
+  });
+}
+function panels() {
+  const st = $("unit").value === "st", same = $("sameT").checked;
+  const med = {}; convs.forEach((c, ci) => rowsOf(c).forEach(r => { if (r.f0_median) (med[ci + r.speaker] ||= []).push(r.f0_median); })); for (const k in med) med[k] = median(med[k]);
+  const val = (r, h) => st ? 12 * Math.log2(h / med[r._c + r.speaker]) : h;
+  const pts = convs.flatMap(c => rowsOf(c).flatMap(r => (r.contour || []).filter(p => p[1]).map(p => val(r, p[1]))));
+  if (!pts.length) { $("panels").innerHTML = `<p class="muted">no voiced pitch found</p>`; return; }
+  const lo = Math.min(...pts), hi = Math.max(...pts), pad = (hi - lo) * .08 || 1;
+  const spans = convs.map(c => Math.max(1, ...rowsOf(c).map(r => r.start_s + r.dur_s)));
+  const tmax = Math.max(...spans);
+  $("panels").innerHTML = ""; hits = [];
+  convs.forEach((c, ci) => {
+    const div = document.createElement("div"); div.className = "panel";
+    div.innerHTML = `<div class="cap"><span class="badge">${L4[ci]}</span><b>${c.label || c.name}</b><span class="muted">${c.name}</span></div><canvas></canvas>`;
+    $("panels").appendChild(div);
+    const cv = div.querySelector("canvas"), [g, W, H] = fit(cv, 170), Lm = 50, R = 10, T = 6, B = 20, full = W - Lm - R;
+    const tspan = same ? tmax : spans[ci], pw = full * (spans[ci] / tspan);
+    const X = t => Lm + t / spans[ci] * pw, Y = v => T + (1 - (v - (lo - pad)) / (hi - lo + 2 * pad)) * (H - T - B);
+    g.fillStyle = css("--muted"); g.strokeStyle = css("--line");
+    for (let k = 0; k <= 3; k++) { const v = lo - pad + (hi - lo + 2 * pad) * k / 3, y = Y(v); g.beginPath(); g.moveTo(Lm, y); g.lineTo(Lm + pw, y); g.stroke(); g.textAlign = "right"; g.fillText(v.toFixed(st ? 1 : 0), Lm - 6, y + 4); }
+    g.textAlign = "center"; const step = Math.max(1, Math.round(tspan / 10 / 5) * 5);
+    for (let t = 0; t <= spans[ci]; t += step) g.fillText(t + "s", X(t), H - 5);
+    const mine = [];
+    rowsOf(c).forEach(r => {
+      const on = sel && sel._c === ci && sel._i === r._i;
+      g.strokeStyle = spkColor(r.speaker); g.lineWidth = on ? 3.5 : 1.8; g.globalAlpha = !sel || on ? 1 : .5;
+      let open = false; g.beginPath();
+      for (const [t, h] of r.contour || []) { if (!h) { open = false; continue; } const x = X(t), y = Y(val(r, h)); open ? g.lineTo(x, y) : g.moveTo(x, y); open = true; mine.push([x, y, r]); }
+      g.stroke();
+    });
+    g.globalAlpha = 1;
+    cv.onclick = e => { const b = cv.getBoundingClientRect(), x = e.clientX - b.left, y = e.clientY - b.top; let best = null, d = 900; for (const h of mine) { const dd = (h[0] - x) ** 2 + (h[1] - y) ** 2; if (dd < d) { d = dd; best = h[2]; } } if (best) pick(best); };
+  });
+}
+function table() {
+  const fc = $("fconv").value, fs = $("fspk").value;
+  const rs = convs.flatMap(c => rowsOf(c)).filter(r => (fc === "" || r._c == fc) && (!fs || r.speaker === fs))
+    .sort((a, b) => { const x = a[sortKey], y = b[sortKey]; return ((x == null) - (y == null) || (x > y ? 1 : x < y ? -1 : 0) * sortDir); });
+  $("thead").innerHTML = "<tr>" + COLS.map(([k, l]) => `<th data-k="${k}">${l}${k === sortKey ? (sortDir > 0 ? " ▲" : " ▼") : ""}</th>`).join("") + "</tr>";
+  $("thead").querySelectorAll("th").forEach(th => th.onclick = () => { const k = th.dataset.k; sortDir = k === sortKey ? -sortDir : 1; sortKey = k; table(); });
+  $("tbody").innerHTML = rs.map((r, n) => `<tr data-n="${n}" class="${sel === r ? "sel" : ""}">` + COLS.map(([k]) => `<td class="${k === "text" ? "txt" : ""}">${r[k] ?? ""}</td>`).join("") + "</tr>").join("");
+  $("tbody").querySelectorAll("tr").forEach(tr => tr.onclick = () => pick(rs[+tr.dataset.n]));
+}
+function pick(r) {
+  sel = r; panels(); table();
+  const a = $("audio"), url = convs[r._c].audio; if (!url) return;
+  if (a.getAttribute("src") !== url) a.src = url;
+  a.currentTime = r.start_s; stopAt = r.start_s + r.dur_s; a.play();
+}
+$("audio").ontimeupdate = () => { if (stopAt && $("audio").currentTime >= stopAt) { $("audio").pause(); stopAt = 0; } };
+$("noaiz").onchange = () => { if (convs.length) { sel = null; summary(); strip(); panels(); table(); } };
+$("metric").onchange = $("dspk").onchange = strip; $("unit").onchange = $("sameT").onchange = panels; $("fconv").onchange = $("fspk").onchange = table;
+window.onresize = () => { if (convs.length) { strip(); panels(); } };
+$("csv").onclick = () => {
+  const esc = v => v == null ? "" : /[",\n]/.test(v) ? `"${String(v).replace(/"/g, '""')}"` : v;
+  const rs = convs.flatMap((c, i) => c.rows.map(r => ({ ...r, conv: label(c, i) })));
+  const csv = "﻿" + COLS.map(c => c[0]).join(",") + "\n" + rs.map(r => COLS.map(([k]) => esc(r[k])).join(",")).join("\n");
+  const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" })); a.download = "prosody_compare.csv"; a.click();
+};
+</script>
+</body>
+</html>
