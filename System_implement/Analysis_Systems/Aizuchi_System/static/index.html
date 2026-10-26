@@ -111,6 +111,8 @@
     <label>Mic level
       <progress id="lvl" max="0.1" value="0" style="width:140px"></progress>
     </label>
+    <button id="mic-test" title="Records 5 seconds from the microphone and plays it back. Nothing is saved or sent.">🎤 Test mic (not saved)</button>
+    <span id="mic-test-msg" class="muted" style="max-width:420px"></span>
     <button id="reset">Reset chat</button>
   </section>
 
@@ -872,6 +874,47 @@ $("mic").onclick = async () => {
     setStatus("Mic error: " + e.message); dbg("mic error: " + e.message, "warn"); scriptEvent("mic error: " + e.message, null);
     if (!$("pv").hidden) { $("pv-msg").textContent = "マイクを使えません: " + e.message; $("pv-msg").hidden = false; $("pv-start").hidden = false; }  // the participant view shows no status line
   }
+};
+
+// ---------- microphone test: record a few seconds, show the level, play it back. Nothing is saved or sent anywhere. ----------
+let micTest = null;
+$("mic-test").onclick = async () => {
+  if (micTest) { micTest.stop(); return; }                       // a second tap ends the test early
+  if (listening) { $("mic-test-msg").textContent = "Stop the conversation first: the microphone is in use."; return; }
+  const msg = t => { $("mic-test-msg").textContent = t; };
+  // Safari only lets audio start inside the click: create / unlock everything here, before the first await.
+  const player = new Audio(); player.src = SILENT_WAV; player.play().catch(() => {});
+  const ctx = new (window.AudioContext || window.webkitAudioContext)(); ctx.resume().catch(() => {});
+  let stream;
+  try {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error("open this page on https:// or http://localhost");
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+  } catch (e) { msg("Mic error: " + e.message); ctx.close().catch(() => {}); return; }
+  const an = ctx.createAnalyser(); an.fftSize = 1024; ctx.createMediaStreamSource(stream).connect(an);
+  const buf = new Float32Array(an.fftSize), chunks = [], rec = new MediaRecorder(stream);
+  let peak = 0, sum = 0, n = 0, t0 = Date.now(), done = false;
+  rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+  const finish = () => {
+    if (done) return; done = true; clearInterval(tick); micTest = null; $("mic-test").textContent = "🎤 Test mic (not saved)";
+    stream.getTracks().forEach(t => t.stop()); ctx.close().catch(() => {}); $("lvl").value = 0;
+    const speech = n ? sum / n : 0, th = +$("th").value;
+    const verdict = peak < 0.03 ? "very quiet — move closer or raise the microphone input volume" : peak > 0.9 ? "too loud (clipping) — lower the input volume"
+      : speech < th * 1.5 ? `OK, but your voice is close to the mic threshold (${th.toFixed(3)}), so quiet sounds like "うん" may be missed — lower the threshold or raise the volume`
+      : "OK";
+    msg(`Peak ${peak.toFixed(2)}, voice level ${speech.toFixed(3)} (threshold ${th.toFixed(3)}): ${verdict}. Playing it back… (not saved)`);
+    const blob = new Blob(chunks, { type: rec.mimeType || "audio/webm" }), url = URL.createObjectURL(blob);
+    player.onended = player.onerror = () => { URL.revokeObjectURL(url); msg(`Peak ${peak.toFixed(2)}, voice level ${speech.toFixed(3)} (threshold ${th.toFixed(3)}): ${verdict}. Nothing was saved.`); };
+    player.src = url; player.play().catch(() => msg("Could not play the recording back (browser blocked it). Level: " + `peak ${peak.toFixed(2)}, voice ${speech.toFixed(3)}.`));
+  };
+  rec.onstop = finish;
+  const tick = setInterval(() => {
+    an.getFloatTimeDomainData(buf); let s = 0, pk = 0; for (const x of buf) { s += x * x; pk = Math.max(pk, Math.abs(x)); }
+    const rms = Math.sqrt(s / buf.length); $("lvl").value = rms; peak = Math.max(peak, pk); if (rms > 0.01) { sum += rms; n++; }
+    const left = Math.max(0, 5 - (Date.now() - t0) / 1000); msg(`Speak now… ${left.toFixed(0)} s (tap again to stop)`);
+    if (left <= 0 && rec.state === "recording") rec.stop();
+  }, 50);
+  micTest = { stop: () => { if (rec.state === "recording") rec.stop(); } };
+  $("mic-test").textContent = "■ Stop test"; rec.start();
 };
 
 // ---------- tabs + debug ----------
